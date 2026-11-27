@@ -21,6 +21,7 @@ class Settings(BaseSettings):
 
     # Storage. Empty -> in-process stores (single replica only).
     redis_url: str | None = None
+    redis_max_connections: int = Field(default=200, ge=1)
 
     # Observability
     log_level: str = "INFO"
