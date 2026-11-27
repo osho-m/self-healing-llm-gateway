@@ -1,0 +1,20 @@
+# __SLACK_WEBHOOK_URL__ is substituted from the SLACK_WEBHOOK_URL env var at container start (entrypoint.sh).
+route:
+  receiver: slack
+  group_by: [alertname, provider, team, tier]
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 1h
+
+receivers:
+  - name: slack
+    slack_configs:
+      - api_url: "__SLACK_WEBHOOK_URL__"
+        channel: "#llm-gateway-alerts"
+        send_resolved: true
+        title: '[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }} ({{ .CommonLabels.severity }})'
+        text: |-
+          {{ range .Alerts }}*{{ .Annotations.summary }}*
+          {{ .Annotations.description }}
+          {{ if .Labels.provider }}Provider: `{{ .Labels.provider }}` {{ end }}{{ if .Labels.team }}Team: `{{ .Labels.team }}` {{ end }}{{ if .Labels.tier }}Tier: `{{ .Labels.tier }}`{{ end }}
+          {{ end }}

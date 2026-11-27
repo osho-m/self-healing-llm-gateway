@@ -1,0 +1,91 @@
+# Gateway policy. Hot-reloaded when this file changes (GATEWAY_POLICY_RELOAD_INTERVAL_S).
+# Runtime overrides from PATCH /v1/admin/teams/{id} take precedence until cleared.
+#
+# Keys: prefer `api_key_sha256` (generate with: python scripts/hash_key.py <key>).
+# `api_keys` (plaintext) is accepted for local demos only - never commit real keys.
+
+providers:
+  - name: mock-primary
+    kind: mock
+    model: mock-large
+    input_price_per_mtok: 0.15
+    output_price_per_mtok: 0.60
+    mock_latency_ms: 20
+  - name: mock-secondary
+    kind: mock
+    model: mock-small
+    input_price_per_mtok: 0.10
+    output_price_per_mtok: 0.40
+    mock_latency_ms: 35
+  # Real providers: add an entry and reference it from a tier chain.
+  # - name: openai-gpt4o
+  #   kind: openai
+  #   model: gpt-4o
+  #   api_key_env: OPENAI_API_KEY
+  #   input_price_per_mtok: 2.50
+  #   output_price_per_mtok: 10.00
+  # - name: anthropic-sonnet
+  #   kind: anthropic
+  #   model: claude-sonnet-5-5
+  #   api_key_env: ANTHROPIC_API_KEY
+  #   input_price_per_mtok: 3.00
+  #   output_price_per_mtok: 15.00
+  # - name: ollama-local
+  #   kind: ollama
+  #   model: llama3.2:3b
+  #   base_url: http://host.docker.internal:11434/v1
+
+# Fallback chains are per capability tier, not per vendor model.
+tiers:
+  economy: [mock-secondary, mock-primary]
+  balanced: [mock-primary, mock-secondary]
+  premium: [mock-primary, mock-secondary]
+
+teams:
+  - team_id: demo
+    name: Demo team
+    api_keys: [demo-live-key]
+    allowed_tiers: [economy, balanced, premium]
+    requests_per_minute: 120
+    tokens_per_minute: 200000
+    daily_budget_usd: 5.0
+    batch_reserve_ratio: 0.2
+    enrichment:
+      system_prompt: "You are a helpful assistant operating behind the company LLM gateway."
+      blocked_terms: ["internal-only-codename"]
+  - team_id: search
+    name: Search (high volume)
+    api_keys: [search-live-key]
+    allowed_tiers: [economy, balanced]
+    requests_per_minute: 30
+    tokens_per_minute: 30000
+    daily_budget_usd: 1.0
+  - team_id: compliance
+    name: Compliance (enriched)
+    api_keys: [compliance-live-key]
+    allowed_tiers: [balanced, premium]
+    requests_per_minute: 60
+    tokens_per_minute: 60000
+    daily_budget_usd: 2.0
+    enrichment:
+      disclaimer: "AI-generated content. Verify before relying on it."
+  - team_id: loadtest
+    name: Load test
+    api_keys: [loadtest-key]
+    allowed_tiers: [economy, balanced, premium]
+    requests_per_minute: 100000
+    tokens_per_minute: 100000000
+    daily_budget_usd: 1000.0
+
+resilience:
+  max_retries: 3
+  backoff_base_s: 0.05
+  backoff_max_s: 1.0
+  circuit_failure_threshold: 3
+  circuit_window_s: 30
+  circuit_cooldown_s: 15
+  health_check_interval_s: 30
+  health_window_s: 300
+  degraded_error_rate: 0.05
+  down_error_rate: 0.5
+  degraded_p99_ms: 5000
