@@ -88,3 +88,30 @@ def test_production_requires_admin_key_and_redis():
     with pytest.raises(ValidationError):
         Settings(environment="production", admin_api_key="x" * 32, redis_url=None)
     Settings(environment="production", admin_api_key="x" * 32, redis_url="redis://x")
+
+
+def test_production_rejects_placeholder_admin_keys():
+    from app.settings import Settings
+
+    for key in ("demo-admin-key-change-me-0000", "x" * 20 + "-changeme-xxxxx", "example-admin-key-0123456789"):
+        with pytest.raises(ValidationError, match="placeholder"):
+            Settings(environment="production", admin_api_key=key, redis_url="redis://x")
+
+
+def test_production_forbids_plaintext_api_keys(policy_file):
+    path = policy_file()  # BASE_POLICY uses plaintext api_keys
+    with pytest.raises(ValueError, match="plaintext api_keys"):
+        PolicyManager(path, forbid_plaintext_keys=True)
+
+    hashed = policy_dict()
+    for team in hashed["teams"]:
+        team["api_key_sha256"] = [hash_key(k) for k in team.pop("api_keys")]
+    path.write_text(yaml.safe_dump(hashed))
+    mgr = PolicyManager(path, forbid_plaintext_keys=True)
+    assert mgr.team_by_key("alpha-key").team_id == "alpha"
+
+    # A hot reload that reintroduces plaintext keys is rejected; the last good policy stays.
+    path.write_text(yaml.safe_dump(policy_dict()))
+    os.utime(path, (os.path.getatime(path), os.path.getmtime(path) + 5))
+    assert mgr.reload_if_changed() is False
+    assert mgr.team_by_key("alpha-key").team_id == "alpha"

@@ -26,7 +26,8 @@ class GatewayError(Exception):
         return {"error": {"type": self.code, "code": self.code, "message": self.message}}
 
 
-async def gateway_error_handler(request: Request, exc: GatewayError) -> JSONResponse:
+async def gateway_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    assert isinstance(exc, GatewayError)  # registered only for GatewayError
     headers = dict(exc.headers)
     rid = getattr(request.state, "request_id", None)
     if rid:

@@ -368,7 +368,10 @@ class RedisStore(Store):
         out = {}
         for key, cap, name in zip(self._rk(team), (rpm, tpm), ("requests_remaining", "tokens_remaining"), strict=True):
             tokens, ts = await self.r.hmget(key, "tokens", "ts")
-            out[name] = cap if tokens is None else min(cap, float(tokens) + max(0.0, now - float(ts)) * cap / 60)
+            if tokens is None or ts is None:
+                out[name] = float(cap)
+            else:
+                out[name] = min(cap, float(tokens) + max(0.0, now - float(ts)) * cap / 60)
         return out
 
     async def reserve_budget(self, team, amount_usd, cap_usd) -> BudgetDecision:
