@@ -10,11 +10,11 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-
-import httpx
+from typing import Any
 
 from app.audit import AuditLog
 from app.errors import GatewayError
+from app.http import AiohttpClient
 from app.observability import HEALTH_STATUSES, Metrics, tracer
 from app.policy import PolicyManager, TeamPolicy
 from app.providers import CompletionRequest, CompletionResult, Provider, ProviderError, StreamChunk, build_provider
@@ -46,13 +46,12 @@ class Gateway:
         store: Store,
         metrics: Metrics,
         audit: AuditLog,
-        client: httpx.AsyncClient | None = None,
+        client: Any = None,
         sleep=asyncio.sleep,
     ) -> None:
         self.policy_manager, self.store, self.metrics, self.audit = policy, store, metrics, audit
-        self.client = client or httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=500, max_keepalive_connections=100)
-        )
+        # aiohttp in production (scales with concurrency); tests inject httpx clients with MockTransport.
+        self.client = client or AiohttpClient()
         self.faults = FaultInjector()
         self._sleep = sleep
         self.providers: dict[str, Provider] = {}
