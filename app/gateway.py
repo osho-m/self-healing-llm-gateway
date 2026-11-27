@@ -36,8 +36,9 @@ class Admission:
     reserved_usd: float
     started: float
     rate_headers: dict[str, str]
-    # Largest max_tokens admission reserved for; no provider call may send more.
-    output_cap: int = 0
+    # max_tokens each provider in the chain was admitted with (its min_max_tokens floor applied at
+    # admission time). Calls use these, so a later policy reload cannot exceed the reservation.
+    output_caps: dict[str, int] = field(default_factory=dict)
     provider_time: float = 0.0
     attempts: list[str] = field(default_factory=list)
 
@@ -166,8 +167,8 @@ class Gateway:
         # Each provider may raise max_tokens to its floor (min_max_tokens); reserve for that.
         return max(c.cost_usd(prompt_tokens, max(max_tokens, c.min_max_tokens)) for c in self._chain_configs(tier))
 
-    def _max_output_tokens(self, tier: str, max_tokens: int) -> int:
-        return max(max(max_tokens, c.min_max_tokens) for c in self._chain_configs(tier))
+    def _output_caps(self, tier: str, max_tokens: int) -> dict[str, int]:
+        return {c.name: max(max_tokens, c.min_max_tokens) for c in self._chain_configs(tier)}
 
     async def admit(self, team: TeamPolicy, req: ChatRequest) -> Admission:
         started = time.perf_counter()
@@ -178,8 +179,8 @@ class Gateway:
             raise GatewayError(403, "tier_not_allowed", f"Team {team.team_id!r} may not use tier {req.model!r}.")
         messages = self._enrich(team, req)
         prompt_est = sum(estimate_tokens(m["content"]) for m in messages)
-        output_cap = self._max_output_tokens(req.model, req.max_tokens)
-        token_need = prompt_est + output_cap
+        output_caps = self._output_caps(req.model, req.max_tokens)
+        token_need = prompt_est + max(output_caps.values())
 
         estimate = self._max_cost(req.model, prompt_est, req.max_tokens)
         with tracer.start_as_current_span("gateway.admission") as span, self.metrics.store_duration.time():
@@ -219,22 +220,24 @@ class Gateway:
             "X-RateLimit-Remaining-Tokens": str(int(decision.remaining_tokens)),
         }
         creq = CompletionRequest(messages=messages, max_tokens=req.max_tokens, temperature=req.temperature)
-        return Admission(rid, team, req, creq, estimate, started, rate_headers, output_cap)
+        return Admission(rid, team, req, creq, estimate, started, rate_headers, output_caps)
 
     # ------------------------------------------------------------------ provider invocation
 
-    def _sized(self, name: str, creq: CompletionRequest, cap: int | None) -> CompletionRequest:
-        """Apply the provider's min_max_tokens floor, never exceeding what admission reserved.
+    def _sized(self, name: str, creq: CompletionRequest, caps: dict[str, int] | None) -> CompletionRequest:
+        """Size max_tokens for one provider.
 
-        The floor is read from the current policy, so a reload between admission and the call could
-        raise it; ``cap`` (the admission-time reservation) keeps the request within budget.
+        Admitted requests use the cap admission reserved for that provider. A provider that joined
+        the chain in a reload after admission gets only the requested max_tokens, never a new floor.
+        Calls outside admission (health probes) apply the provider's current floor.
         """
-        tokens = max(creq.max_tokens, self.policy.provider(name).min_max_tokens)
-        if cap:
-            tokens = min(tokens, cap)
+        if caps is None:
+            tokens = max(creq.max_tokens, self.policy.provider(name).min_max_tokens)
+        else:
+            tokens = caps.get(name, creq.max_tokens)
         return creq if tokens == creq.max_tokens else replace(creq, max_tokens=tokens)
 
-    async def _invoke(self, name: str, creq: CompletionRequest, cap: int | None = None) -> CompletionResult:
+    async def _invoke(self, name: str, creq: CompletionRequest, caps: dict[str, int] | None = None) -> CompletionResult:
         fault = self.faults.get(name)
         if fault.latency_ms:
             await asyncio.sleep(fault.latency_ms / 1000)
@@ -243,7 +246,7 @@ class Gateway:
         adapter = self.providers[name]
         adapter.acquire()
         try:
-            return await adapter.complete(self._sized(name, creq, cap))
+            return await adapter.complete(self._sized(name, creq, caps))
         finally:
             await adapter.release()
 
@@ -279,7 +282,7 @@ class Gateway:
                     span.set_attributes({"gateway.provider": name, "gateway.attempt": attempt})
                     t0 = time.perf_counter()
                     try:
-                        result = await self._invoke(name, adm.creq, adm.output_cap)
+                        result = await self._invoke(name, adm.creq, adm.output_caps)
                     except ProviderError as err:
                         elapsed = time.perf_counter() - t0
                         adm.provider_time += elapsed
@@ -407,7 +410,7 @@ class Gateway:
     # ------------------------------------------------------------------ streaming
 
     async def _open_stream(
-        self, name: str, creq: CompletionRequest, cap: int | None = None
+        self, name: str, creq: CompletionRequest, caps: dict[str, int] | None = None
     ) -> tuple[list[StreamChunk], AsyncIterator[StreamChunk], Provider]:
         """Start a provider stream and buffer until the first content delta, so failover stays invisible."""
         fault = self.faults.get(name)
@@ -418,7 +421,7 @@ class Gateway:
         adapter = self.providers[name]
         adapter.acquire()  # released by _sse when the stream ends, or below if opening fails
         try:
-            agen = adapter.stream(self._sized(name, creq, cap)).__aiter__()
+            agen = adapter.stream(self._sized(name, creq, caps)).__aiter__()
             buffered: list[StreamChunk] = []
             async for chunk in agen:
                 buffered.append(chunk)
@@ -443,7 +446,7 @@ class Gateway:
             for attempt in range(res.max_retries + 1):
                 t0 = time.perf_counter()
                 try:
-                    buffered, agen, adapter = await self._open_stream(name, adm.creq, adm.output_cap)
+                    buffered, agen, adapter = await self._open_stream(name, adm.creq, adm.output_caps)
                 except ProviderError as err:
                     elapsed = time.perf_counter() - t0
                     adm.provider_time += elapsed

@@ -396,7 +396,7 @@ async def test_reload_cannot_raise_the_sent_output_cap_above_the_admission_reser
     adm = await gw.admit(
         team, ChatRequest(model="balanced", messages=[ChatMessage(role="user", content="hi")], max_tokens=16)
     )
-    assert adm.output_cap == 16
+    assert adm.output_caps == {"primary": 16, "secondary": 16}
     sent = []
     adapter = gw.providers["primary"]
     original = adapter.complete
@@ -408,6 +408,6 @@ async def test_reload_cannot_raise_the_sent_output_cap_above_the_admission_reser
     adapter.complete = record
     # A reload after admission raises the provider's floor far above what was reserved.
     manager.policy.provider("primary").min_max_tokens = 4096
-    await gw._invoke("primary", adm.creq, adm.output_cap)
+    await gw._invoke("primary", adm.creq, adm.output_caps)
     assert sent == [16]  # capped at the admission-time reservation
     assert gw._sized("primary", adm.creq, None).max_tokens == 4096  # probes (no reservation) get the floor

@@ -84,6 +84,8 @@ class FakeAnthropic:
             await resp.prepare(request)
             await asyncio.sleep(30)
             return resp
+        if self.mode == "bad_usage":
+            return web.json_response(message(usage={"input_tokens": "lots", "output_tokens": 2}))
         if self.mode == "bad_json":
             if body.get("stream"):
                 return web.Response(text="event: message_start\ndata: {not json\n\n", content_type="text/event-stream")
@@ -286,6 +288,17 @@ async def test_malformed_json_is_a_retryable_bad_response(fake, streaming):
                 [c async for c in p.stream(REQ)]
             else:
                 await p.complete(REQ)
+    finally:
+        await p.aclose()
+    assert exc.value.kind == "bad_response" and exc.value.retryable
+
+
+async def test_invalid_usage_count_is_a_retryable_bad_response(fake):
+    fake.mode = "bad_usage"
+    p = make(fake)
+    try:
+        with pytest.raises(ProviderError) as exc:
+            await p.complete(REQ)
     finally:
         await p.aclose()
     assert exc.value.kind == "bad_response" and exc.value.retryable
