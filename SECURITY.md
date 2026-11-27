@@ -8,7 +8,7 @@ Report suspected vulnerabilities privately to the repository owner. Do not open 
 
 - **Team keys** are stored only as SHA-256 hashes (`api_key_sha256`); generate them with `python scripts/hash_key.py`. The plaintext `api_keys` field exists for local demos and must not be used for real keys.
 - **Admin routes** require a separate `GATEWAY_ADMIN_API_KEY` (compared in constant time) or a team key whose policy `role` is `admin`. Standard team keys receive `403`. Every admin action is written to an append-only audit log.
-- **Production mode** (`GATEWAY_ENVIRONMENT=production`) refuses to start without Redis and an admin key of at least 24 characters.
+- **Production mode** (`GATEWAY_ENVIRONMENT=production`) refuses to start without Redis, without an admin key of at least 24 characters, or with an admin key that looks like a documented placeholder (`demo`, `example`, `change-me`). It also rejects policy files that contain plaintext `api_keys`, both at startup and on hot reload, so only `api_key_sha256` hashes are accepted.
 - **Provider credentials** are read from environment variables named in the policy (`api_key_env`) and are never logged or returned.
 - **Fault-injection endpoints** are admin-only on the gateway. The mock provider's `/fault` endpoint has no authentication and must never be exposed outside a test network.
 - `/metrics` is unauthenticated, following Prometheus convention. Restrict it at the network layer.

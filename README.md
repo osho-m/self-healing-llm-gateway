@@ -92,7 +92,7 @@ pip install -e '.[dev]'
 GATEWAY_ADMIN_API_KEY=demo-admin-key-change-me-0000 uvicorn app.main:app_factory --factory --reload
 ```
 
-Without `GATEWAY_REDIS_URL` the gateway uses in-process stores, which is fine for a single replica in development. `GATEWAY_ENVIRONMENT=production` refuses to start without Redis and a 24+ character admin key.
+Without `GATEWAY_REDIS_URL` the gateway uses in-process stores, which is fine for a single replica in development. `GATEWAY_ENVIRONMENT=production` refuses to start without Redis, with a short or placeholder admin key, or with plaintext `api_keys` in the policy (see [SECURITY.md](SECURITY.md)).
 
 ### Hugging Face Space (no Docker, no keys)
 
