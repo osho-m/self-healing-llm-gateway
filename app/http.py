@@ -85,15 +85,18 @@ class AiohttpClient:
         # Resolve HTTP(S)_PROXY / NO_PROXY ourselves instead of aiohttp's trust_env, which also applies
         # .netrc credentials (and in some versions lets them replace an explicit Authorization header).
         self._proxies = {k: v for k, v in getproxies().items() if k in ("http", "https")}
-        self._proxy_cache: dict[tuple[str, str], str | None] = {}
+        self._proxy_cache: dict[tuple[str, str, int | None], str | None] = {}
 
     def proxy_for(self, url: str) -> str | None:
         """Proxy URL for a request, honouring NO_PROXY (same semantics as httpx/urllib)."""
         parts = urlsplit(url)
-        key = (parts.scheme, parts.hostname or "")
+        host = parts.hostname or ""
+        key = (parts.scheme, host, parts.port)
         if key not in self._proxy_cache:
             proxy = self._proxies.get(parts.scheme)
-            self._proxy_cache[key] = None if not proxy or proxy_bypass(parts.hostname or "") else proxy
+            # Pass host:port so port-qualified NO_PROXY entries (internal.example:8443) match.
+            target = f"{host}:{parts.port}" if parts.port else host
+            self._proxy_cache[key] = None if not proxy or proxy_bypass(target) else proxy
         return self._proxy_cache[key]
 
     def _get_session(self):
