@@ -62,7 +62,7 @@ class TeamPolicy(BaseModel):
 
 class ProviderConfig(BaseModel):
     name: str
-    kind: Literal["mock", "openai", "anthropic", "ollama"]
+    kind: Literal["mock", "openai", "anthropic", "ollama", "local"]
     model: str = "mock-model"
     base_url: str | None = None
     api_key_env: str | None = None

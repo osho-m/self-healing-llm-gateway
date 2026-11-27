@@ -122,6 +122,10 @@ class Provider(ABC):
     @abstractmethod
     def stream(self, request: CompletionRequest) -> AsyncIterator[StreamChunk]: ...
 
+    def is_available(self) -> bool:
+        """False when the provider cannot serve at all (e.g. an in-process model that is not loaded)."""
+        return True
+
     async def aclose(self) -> None:
         """Release provider-owned resources (SDK clients). Shared HTTP clients are closed by the gateway."""
         return None
