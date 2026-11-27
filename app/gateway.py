@@ -229,14 +229,13 @@ class Gateway:
     def _sized(self, name: str, creq: CompletionRequest, caps: dict[str, int] | None) -> CompletionRequest:
         """Size max_tokens for one provider.
 
-        Admitted requests use the cap admission reserved for that provider. A provider that joined
-        the chain in a reload after admission gets only the requested max_tokens, never a new floor.
-        Calls outside admission (health probes) apply the provider's current floor.
+        Admitted requests use the cap admission reserved for that provider (routing skips providers
+        that were not part of the admission snapshot). Calls outside admission (health probes) apply
+        the provider's current floor.
         """
-        if caps is None:
-            tokens = max(creq.max_tokens, self.policy.provider(name).min_max_tokens)
-        else:
-            tokens = caps.get(name, creq.max_tokens)
+        if caps is not None:
+            return replace(creq, max_tokens=caps[name])
+        tokens = max(creq.max_tokens, self.policy.provider(name).min_max_tokens)
         return creq if tokens == creq.max_tokens else replace(creq, max_tokens=tokens)
 
     async def _invoke(self, name: str, creq: CompletionRequest, caps: dict[str, int] | None = None) -> CompletionResult:
@@ -249,6 +248,9 @@ class Gateway:
         adapter.acquire()
         try:
             return await adapter.complete(self._sized(name, creq, caps))
+        except ProviderError as err:
+            self._price_usage(adapter, err)
+            raise
         finally:
             await adapter.release()
 
@@ -261,8 +263,12 @@ class Gateway:
         self.metrics.provider_latency.labels(name).observe(seconds)
         self._evaluate_health(name)
 
-    def _billed(self, name: str, err: ProviderError) -> float:
-        return self.policy.provider(name).cost_usd(*err.usage) if err.usage else 0.0
+    @staticmethod
+    def _price_usage(adapter: Provider, err: ProviderError) -> None:
+        # Price billed usage with the invoked adapter's own config: a reload during the call may
+        # have removed the provider or changed its prices.
+        if err.usage:
+            err.billed_usd = adapter.config.cost_usd(*err.usage)
 
     def _non_retryable(self, err: ProviderError) -> GatewayError:
         if err.kind == "content_policy":
@@ -277,6 +283,10 @@ class Gateway:
         for idx, name in enumerate(chain):
             if not self._configured(name):
                 adm.attempts.append(f"{name}: not configured")
+                continue
+            if name not in adm.output_caps:
+                # Became available in a reload after admission: no budget was reserved for it.
+                adm.attempts.append(f"{name}: not admitted")
                 continue
             breaker = self.breakers[name]
             if not breaker.allow():
@@ -297,7 +307,7 @@ class Gateway:
                         adm.attempts.append(f"{name}: {err.kind}")
                         if not err.retryable:
                             breaker.release()
-                            adm.failed_cost_usd = self._billed(name, err)
+                            adm.failed_cost_usd = err.billed_usd
                             raise self._non_retryable(err) from err
                         breaker.record_failure()
                         if breaker.state != CLOSED or attempt == res.max_retries:
@@ -433,6 +443,10 @@ class Gateway:
                 buffered.append(chunk)
                 if chunk.delta or chunk.finish_reason:
                     break
+        except ProviderError as err:
+            self._price_usage(adapter, err)
+            await adapter.release()
+            raise
         except BaseException:
             await adapter.release()
             raise
@@ -444,6 +458,10 @@ class Gateway:
         for idx, name in enumerate(chain):
             if not self._configured(name):
                 adm.attempts.append(f"{name}: not configured")
+                continue
+            if name not in adm.output_caps:
+                # Became available in a reload after admission: no budget was reserved for it.
+                adm.attempts.append(f"{name}: not admitted")
                 continue
             breaker = self.breakers[name]
             if not breaker.allow():
@@ -461,8 +479,7 @@ class Gateway:
                     adm.attempts.append(f"{name}: {err.kind}")
                     if not err.retryable:
                         breaker.release()
-                        cost = self._billed(name, err)
-                        await self.store.settle_budget(adm.team.team_id, adm.reserved_usd, cost)
+                        await self.store.settle_budget(adm.team.team_id, adm.reserved_usd, err.billed_usd)
                         raise self._non_retryable(err) from err
                     breaker.record_failure()
                     if breaker.state != CLOSED or attempt == res.max_retries:
@@ -564,10 +581,13 @@ class Gateway:
             self._observe(adm, provider, time.perf_counter() - adm.started)
         except ProviderError as err:
             if err.usage:  # the provider reported what it billed (e.g. a refusal): charge exactly that
-                cost = self._billed(provider, err)
-                await self.store.settle_budget(team.team_id, adm.reserved_usd, cost)
+                self._price_usage(adapter, err)
+                await self.store.settle_budget(team.team_id, adm.reserved_usd, err.billed_usd)
                 settled = True
-            breaker.record_failure()
+            if err.retryable:
+                breaker.record_failure()
+            else:  # e.g. a refusal: the provider is healthy, so it must not trip the shared breaker
+                breaker.release()
             self._record(provider, False, time.perf_counter() - t0, err)
             self.metrics.errors.labels(team.team_id, tier, provider, f"stream_{err.kind}").inc()
             self.metrics.requests.labels(team.team_id, tier, provider, "502", adm.req.priority).inc()

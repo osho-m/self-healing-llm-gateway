@@ -189,6 +189,9 @@ class AnthropicProvider(Provider):
                     elif event.type == "content_block_delta" and event.delta.type == "text_delta":
                         yield StreamChunk(delta=event.delta.text)
                     elif event.type == "message_delta":
+                        # Delta usage is cumulative; input_tokens, when present, supersedes message_start.
+                        if getattr(event.usage, "input_tokens", None) is not None:
+                            prompt_tokens = self._tokens(event.usage.input_tokens)
                         if event.delta.stop_reason == "refusal":
                             usage = (prompt_tokens, self._tokens(event.usage.output_tokens))
                             raise self._refusal(getattr(event.delta, "stop_details", None), usage)
