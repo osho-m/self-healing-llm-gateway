@@ -1,25 +1,42 @@
-# Real-model policy: a local Ollama model as the primary, with a deterministic mock as fallback.
-#   ollama pull qwen2.5:0.5b
+# Run the gateway on your own machine with three open-source models served by Ollama.
+#
+#   ollama pull smollm2:1.7b
+#   ollama pull qwen2.5:1.5b
+#   ollama pull phi3.5:3.8b
 #   GATEWAY_POLICY_PATH=config/policy.ollama.yml uvicorn app.main:app_factory --factory
-# Stop Ollama mid-run to watch real connection errors trip the circuit and fail over.
+#
+# Each tier starts with one model and falls back to the other two, then the mock.
+# Stop Ollama mid-run to watch real connection errors open the circuits and fail over.
 providers:
-  - name: ollama-local
+  - name: smollm2
     kind: ollama
-    model: qwen2.5:0.5b
+    model: smollm2:1.7b
     base_url: http://127.0.0.1:11434/v1
     timeout_s: 60
-  - name: mock-fallback
+  - name: qwen
+    kind: ollama
+    model: qwen2.5:1.5b
+    base_url: http://127.0.0.1:11434/v1
+    timeout_s: 60
+  - name: phi
+    kind: ollama
+    model: phi3.5:3.8b
+    base_url: http://127.0.0.1:11434/v1
+    timeout_s: 60
+  - name: mock
     kind: mock
     model: mock-small
 
 tiers:
-  balanced: [ollama-local, mock-fallback]
+  economy: [smollm2, qwen, phi, mock]
+  balanced: [qwen, phi, smollm2, mock]
+  premium: [phi, qwen, smollm2, mock]
 
 teams:
   - team_id: demo
     name: Demo team
     api_keys: [demo-live-key]
-    allowed_tiers: [balanced]
+    allowed_tiers: [economy, balanced, premium]
     requests_per_minute: 120
     tokens_per_minute: 200000
     daily_budget_usd: 5.0
