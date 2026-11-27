@@ -207,3 +207,15 @@ def test_https_scheme_proxy_is_rejected_not_silently_bypassed(monkeypatch):
         AiohttpClient()
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
     AiohttpClient()
+
+
+@pytest.mark.parametrize("order", [(8443, 9443), (9443, 8443)])
+async def test_port_qualified_no_proxy(monkeypatch, order):
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
+    monkeypatch.setenv("NO_PROXY", "internal.example:8443")
+    client = AiohttpClient()
+    expected = {8443: None, 9443: "http://proxy.internal:3128"}
+    for port in order:
+        assert client.proxy_for(f"https://internal.example:{port}/v1") == expected[port]
