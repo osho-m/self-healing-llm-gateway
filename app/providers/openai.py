@@ -44,7 +44,7 @@ class OpenAICompatibleProvider(Provider):
             resp = await self.client.post(
                 self._url(), json=self._payload(request, False), headers=self._headers(), timeout=self.config.timeout_s
             )
-            if resp.status_code >= 400:
+            if not 200 <= resp.status_code < 300:
                 raise error_from_status(self.name, resp.status_code, resp.text)
             data = resp.json()
             choice = data["choices"][0]
@@ -72,7 +72,7 @@ class OpenAICompatibleProvider(Provider):
                 headers=self._headers(),
                 timeout=self.config.timeout_s,
             ) as resp:
-                if resp.status_code >= 400:
+                if not 200 <= resp.status_code < 300:
                     body = (await resp.aread()).decode(errors="replace")
                     raise error_from_status(self.name, resp.status_code, body)
                 async for _event, data in iter_sse(resp):

@@ -8,6 +8,10 @@ also satisfies - tests keep using httpx with MockTransport.
 
 aiohttp errors are re-raised as the equivalent httpx exceptions so provider error classification
 (retryable timeout / connection error) stays in one place.
+
+Redirects are never followed (as with httpx's default): aiohttp would forward custom credential
+headers such as Anthropic's ``x-api-key`` to the redirect target, including other origins. A 3xx
+from a provider surfaces as a non-retryable error instead.
 """
 
 from __future__ import annotations
@@ -71,7 +75,8 @@ class AiohttpClient:
             connector = aiohttp.TCPConnector(
                 limit=self.max_connections, limit_per_host=self.max_per_host, ttl_dns_cache=300, keepalive_timeout=30
             )
-            self._session = aiohttp.ClientSession(connector=connector, raise_for_status=False)
+            # trust_env: honour HTTPS_PROXY/NO_PROXY like httpx did (aiohttp ignores them by default).
+            self._session = aiohttp.ClientSession(connector=connector, raise_for_status=False, trust_env=True)
         return self._session
 
     async def post(self, url: str, *, json: Any, headers: dict[str, str], timeout: float) -> HttpResponse:
@@ -79,7 +84,11 @@ class AiohttpClient:
 
         try:
             async with self._get_session().post(
-                url, json=json, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)
+                url,
+                json=json,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+                allow_redirects=False,
             ) as resp:
                 return HttpResponse(resp.status, await resp.read())
         except (TimeoutError, aiohttp.ClientError) as exc:
@@ -95,7 +104,7 @@ class AiohttpClient:
         client_timeout = aiohttp.ClientTimeout(total=None, connect=timeout, sock_read=timeout)
         try:
             async with self._get_session().request(
-                method, url, json=json, headers=headers, timeout=client_timeout
+                method, url, json=json, headers=headers, timeout=client_timeout, allow_redirects=False
             ) as resp:
                 yield StreamResponse(resp)
         except (TimeoutError, aiohttp.ClientError) as exc:
