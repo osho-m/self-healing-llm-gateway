@@ -133,7 +133,7 @@ async def store(request):
         yield MemoryStore()
         return
     url = os.environ.get("REDIS_URL", "redis://localhost:6379/15")
-    s = RedisStore(url, prefix=f"test{os.getpid()}")
+    s = RedisStore(url, prefix=f"test{os.getpid()}", max_connections=20)  # < test concurrency: must queue, not fail
     if not await s.ping():
         if os.environ.get("REQUIRE_REDIS"):
             pytest.fail(f"REQUIRE_REDIS set but Redis unreachable at {url}")

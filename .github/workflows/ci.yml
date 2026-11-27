@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12", cache: pip }
-      - run: pip install ruff
+      - run: pip install ruff==0.17.6
       - run: ruff check .
       - run: ruff format --check .
       - name: Dashboards are generated from scripts/gen_dashboards.py
@@ -45,7 +45,7 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "${{ matrix.python }}", cache: pip }
       - run: pip install -e '.[dev]'
-      - run: pytest -q --cov=app --cov-report=term-missing --cov-fail-under=85
+      - run: pytest -q -rfE --cov=app --cov-report=term-missing --cov-fail-under=85
 
   observability-config:
     runs-on: ubuntu-latest
