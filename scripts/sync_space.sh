@@ -20,7 +20,8 @@ AUTHOR_EMAIL="${AUTHOR##*<}"; AUTHOR_EMAIL="${AUTHOR_EMAIL%>}"
 git fetch -q origin main
 git fetch -q "$SPACE_URL" main:refs/remotes/space/main
 
-IMAGES_URL="https://raw.githubusercontent.com/osho-m/self-healing-llm-gateway/main/docs/images/"
+# Pinned to the synced commit, so the images always match the published README.
+IMAGES_URL="https://raw.githubusercontent.com/osho-m/self-healing-llm-gateway/$(git rev-parse origin/main)/docs/images/"
 readme="$(git show origin/main:deploy/huggingface/space-header.md
   git show origin/main:README.md | sed "s#](docs/images/#](${IMAGES_URL}#g")"
 readme_blob="$(printf '%s\n' "$readme" | git hash-object -w --stdin)"
@@ -29,7 +30,7 @@ index="$(mktemp)"
 trap 'rm -f "$index"' EXIT
 GIT_INDEX_FILE="$index" git read-tree origin/main
 GIT_INDEX_FILE="$index" git update-index --cacheinfo "100644,$readme_blob,README.md"
-GIT_INDEX_FILE="$index" git rm -r -q --cached --ignore-unmatch docs/images
+GIT_INDEX_FILE="$index" git rm -r -q -f --cached --ignore-unmatch docs/images
 tree="$(GIT_INDEX_FILE="$index" git write-tree)"
 
 if [ "$tree" = "$(git rev-parse refs/remotes/space/main^{tree})" ]; then
