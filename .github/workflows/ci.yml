@@ -70,6 +70,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
+      - name: Runner hardware (context for the load-test numbers)
+        run: |
+          echo "vCPUs=$(nproc) mem=$(free -g | awk '/Mem:/{print $2}')GiB"
+          lscpu | grep -i "model name"
       - name: Start stack
         run: docker compose up -d --build --wait gateway redis mock-primary mock-secondary jaeger
       - name: Smoke test
