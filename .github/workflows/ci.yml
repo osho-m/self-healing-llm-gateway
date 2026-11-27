@@ -94,7 +94,7 @@ jobs:
           curl -fsS localhost:8000/metrics | grep -E '^gateway_(fallbacks|circuit_state)' || true
       - name: Load test (measured in CI, numbers in job log)
         run: |
-          pip install httpx
+          pip install aiohttp
           python loadtests/loadtest.py --requests 5000 --concurrency 500 | tee loadtest-report.json
       - name: Logs on failure
         if: failure()
