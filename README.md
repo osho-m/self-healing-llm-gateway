@@ -206,7 +206,7 @@ The test suite covers:
 - streaming output that matches non-streaming output, plus failover before the first byte;
 - enrichment, admin RBAC and auditing, and policy hot reload.
 
-CI runs the suite on Python 3.11–3.13 against a real Redis instance; the Redis tests fail rather than skip if Redis is missing. CI also validates the Prometheus and Alertmanager configs, boots the compose stack, smoke-tests failover against real HTTP faults injected into the mock provider, and runs two load tests: a 5,000-request capacity run, and an overhead SLO run that fails CI if p95 exceeds 10 ms at 100 req/s.
+CI runs the suite on Python 3.11–3.13 against a real Redis instance; the Redis tests fail rather than skip if Redis is missing. CI also validates the Prometheus and Alertmanager configs, boots the compose stack, smoke-tests failover against real HTTP faults injected into the mock provider, and runs two load tests: a 5,000-request capacity run, and an open-loop run at 100 req/s that fails CI if overhead p95 exceeds 25 ms. That 25 ms limit is a regression guard sized for noisy shared runners.
 
 ## Load test
 
@@ -235,11 +235,11 @@ The two modes measure different things:
 | Capacity: closed loop, 500 in flight, 5,000 requests | **463 req/s** | 73 / 182 / 237 ms (queueing) | 35 / 83 / 159 ms | 4,413 × 200, 587 × 429, zero errors |
 | SLO: open loop at 100 req/s, 3,000 requests | 100 req/s | **1.7 / 3.9 / 7.7 ms** | 0.27 / 0.86 / 3.3 ms | 2,615 × 200, 385 × 429, zero errors |
 
-The CI job **fails if overhead p95 at 100 req/s exceeds 10 ms**. p95 has stayed between 3.9 and 8.3 ms.
+On identical code, overhead p95 at 100 req/s ranged from **3.9 to 12.1 ms** across runs, and capacity from 296 to 463 req/s. That spread depends on which runner the job lands on: in the slowest run, Redis calls alone had p95 4.3 ms, against 0.86 ms in the fastest. CI therefore uses this run as a **regression guard**, failing if p95 exceeds 25 ms, and does not treat it as proof of the 10 ms target.
 
 p99 is reported but not gated, because it is noisy on shared runners: 7.7, 21.4 and 21.8 ms across the last three runs on identical code. Redis calls at p99 (3.3 ms) do not account for the tail; it is CPU scheduling on a 2-vCPU VM that also runs Redis, both mocks, Jaeger and the load generator.
 
-So **p99 < 10 ms is met in some CI runs, not reliably**. On dedicated hardware it is expected to hold, but that has not been measured yet. All values are interpolated within histogram buckets.
+**The <10 ms target is met at p50 in every CI run, at p95 and p99 in some runs, and at every percentile locally.** It has not been verified on dedicated hardware with Redis. That measurement is the remaining step before quoting it as an SLO. All values are interpolated within histogram buckets.
 
 **Local.** Windows 11 laptop with the in-memory store, so there are no Redis round trips:
 
