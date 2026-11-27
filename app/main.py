@@ -115,9 +115,6 @@ def create_app(
             interval = gateway.policy.resilience.health_check_interval_s
             tasks.append(asyncio.create_task(_loop(interval, gateway.probe_all, "health")))
         await gateway.refresh_policy()
-        # Move startup objects (modules, policy, adapters) out of GC generations: shorter GC pauses.
-        gc.collect()
-        gc.freeze()
         log.info("gateway started", extra={"environment": settings.environment, "store": type(store).__name__})
         try:
             yield
@@ -152,7 +149,12 @@ def create_app(
 
 
 def app_factory() -> FastAPI:
-    return create_app()
+    """Process entrypoint (uvicorn --factory). Freezes startup objects out of GC generations once per
+    process for shorter GC pauses; not done in create_app, which tests call many times per process."""
+    app = create_app()
+    gc.collect()
+    gc.freeze()
+    return app
 
 
 def __getattr__(name: str):  # pragma: no cover - lets `uvicorn app.main:app` work without import-time side effects

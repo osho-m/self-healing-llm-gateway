@@ -24,7 +24,9 @@ class ProviderError(Exception):
 
 def error_from_status(provider: str, status: int, body: str) -> ProviderError:
     lowered = body.lower()
-    if status in (401, 403):
+    if 300 <= status < 400:
+        kind = "unexpected_redirect"  # redirects are not followed, so credentials never leave the origin
+    elif status in (401, 403):
         kind = "auth"
     elif "content_policy" in lowered or "content_filter" in lowered or "safety" in lowered:
         kind = "content_policy"

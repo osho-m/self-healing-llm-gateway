@@ -94,3 +94,128 @@ async def test_connection_refused_is_retryable():
         assert exc.value.kind == "connection" and exc.value.retryable
     finally:
         await client.aclose()
+
+
+async def test_redirects_are_not_followed_so_credentials_stay_put(monkeypatch):
+    """A provider 3xx must not forward credential headers (e.g. x-api-key) to the redirect target."""
+    hits = []
+
+    async def redirect(request: web.Request) -> web.Response:
+        raise web.HTTPTemporaryRedirect(location=str(request.url.with_path("/stolen")))
+
+    async def stolen(request: web.Request) -> web.Response:
+        hits.append(request.headers.get("x-api-key"))
+        return web.json_response({})
+
+    app = web.Application()
+    app.router.add_post("/v1/messages", redirect)
+    app.router.add_post("/stolen", stolen)
+    srv = TestServer(app)
+    await srv.start_server()
+    monkeypatch.setenv("TEST_ANTHROPIC_KEY", "sk-secret")
+    client = AiohttpClient()
+    try:
+        cfg = ProviderConfig(
+            name="a", kind="anthropic", model="m", base_url=str(srv.make_url("")), api_key_env="TEST_ANTHROPIC_KEY"
+        )
+        with pytest.raises(ProviderError) as exc:
+            await build_provider(cfg, client).complete(REQ)
+        assert exc.value.status == 307 and not exc.value.retryable
+        assert hits == []
+    finally:
+        await client.aclose()
+        await srv.close()
+
+
+async def test_proxy_env_is_honoured_without_netrc(monkeypatch, tmp_path):
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
+    monkeypatch.setenv("NO_PROXY", "internal.example")
+    # A .netrc entry for the provider host must never replace the explicit Bearer header.
+    netrc = tmp_path / ".netrc"
+    netrc.write_text("machine api.openai.com login user password pass\n")
+    monkeypatch.setenv("NETRC", str(netrc))
+    client = AiohttpClient()
+    try:
+        assert client.proxy_for("https://api.openai.com/v1/chat/completions") == "http://proxy.internal:3128"
+        assert client.proxy_for("https://internal.example/v1") is None
+        assert client._get_session().trust_env is False  # .netrc is never consulted
+    finally:
+        await client.aclose()
+
+
+async def test_bearer_header_reaches_provider_unchanged(monkeypatch, tmp_path):
+    seen = []
+
+    async def capture(request: web.Request) -> web.Response:
+        seen.append(request.headers.get("Authorization"))
+        return web.json_response({"choices": [{"message": {"content": "ok"}}], "usage": {}})
+
+    app = web.Application()
+    app.router.add_post("/capture/chat/completions", capture)
+    server = TestServer(app)
+    await server.start_server()
+    host = server.make_url("").host
+    netrc = tmp_path / ".netrc"
+    netrc.write_text(f"machine {host} login user password pass\n")
+    monkeypatch.setenv("NETRC", str(netrc))
+    monkeypatch.setenv("TEST_KEY", "sk-bearer")
+    client = AiohttpClient()
+    try:
+        cfg = ProviderConfig(
+            name="o", kind="openai", model="m", base_url=str(server.make_url("/capture")), api_key_env="TEST_KEY"
+        )
+        await build_provider(cfg, client).complete(REQ)
+        assert seen == ["Bearer sk-bearer"]
+    finally:
+        await client.aclose()
+        await server.close()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_redirect_with_stalled_body_fails_fast_and_non_retryable(stream):
+    async def stalled_redirect(request: web.Request) -> web.StreamResponse:
+        resp = web.StreamResponse(
+            status=307, headers={"Location": "http://elsewhere.invalid/", "Content-Length": "100"}
+        )
+        await resp.prepare(request)
+        await asyncio.sleep(5)  # never send the promised body
+        return resp
+
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", stalled_redirect)
+    srv = TestServer(app)
+    await srv.start_server()
+    client = AiohttpClient()
+    try:
+        p = provider(str(srv.make_url("/v1")), client, timeout_s=0.5)
+        with pytest.raises(ProviderError) as exc:
+            if stream:
+                [c async for c in p.stream(REQ)]
+            else:
+                await p.complete(REQ)
+        assert exc.value.kind == "unexpected_redirect" and not exc.value.retryable
+    finally:
+        await client.aclose()
+        await srv.close()
+
+
+def test_https_scheme_proxy_is_rejected_not_silently_bypassed(monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "https://proxy.internal:8443")
+    with pytest.raises(ValueError, match="https:// proxy"):
+        AiohttpClient()
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
+    AiohttpClient()
+
+
+@pytest.mark.parametrize("order", [(8443, 9443), (9443, 8443)])
+async def test_port_qualified_no_proxy(monkeypatch, order):
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
+    monkeypatch.setenv("NO_PROXY", "internal.example:8443")
+    client = AiohttpClient()
+    expected = {8443: None, 9443: "http://proxy.internal:3128"}
+    for port in order:
+        assert client.proxy_for(f"https://internal.example:{port}/v1") == expected[port]
