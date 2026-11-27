@@ -293,3 +293,16 @@ def test_stream_overhead_excludes_provider_time(make_client):
     count = float(re.search(r"^gateway_overhead_seconds_count ([0-9.e+]+)$", metrics, re.M).group(1))
     total = float(re.search(r"^gateway_overhead_seconds_sum ([0-9.e+]+)$", metrics, re.M).group(1))
     assert count == 1 and total < 0.1
+
+
+def test_request_id_echo_and_internal_error_shape(client):
+    r = client.get("/healthz", headers={"X-Request-ID": "trace-me-123"})
+    assert r.headers["X-Request-ID"] == "trace-me-123"
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("unexpected")
+
+    client.app.state.gateway.admit = boom
+    r = chat(client)
+    assert r.status_code == 500 and r.json()["error"]["code"] == "internal_error"
+    assert r.headers["X-Request-ID"]

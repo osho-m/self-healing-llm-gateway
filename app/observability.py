@@ -11,7 +11,7 @@ from opentelemetry import trace
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
 LATENCY_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60)
-OVERHEAD_BUCKETS = (0.0005, 0.001, 0.0025, 0.005, 0.0075, 0.01, 0.025, 0.05, 0.1)
+OVERHEAD_BUCKETS = (0.0005, 0.001, 0.0025, 0.005, 0.0075, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0)
 HEALTH_STATUSES = ("healthy", "degraded", "down")
 
 
@@ -45,6 +45,12 @@ class Metrics:
         self.overhead = Histogram(
             "gateway_overhead_seconds", "Gateway time excluding provider calls", buckets=OVERHEAD_BUCKETS, registry=r
         )
+        self.store_duration = Histogram(
+            "gateway_store_duration_seconds",
+            "Request-path state store calls (admission + settlement)",
+            buckets=OVERHEAD_BUCKETS,
+            registry=r,
+        )
         self.tokens = Counter("gateway_tokens_total", "Tokens processed", ["team", "provider", "direction"], registry=r)
         self.cost = Counter("gateway_cost_usd_total", "Spend in USD", ["team", "provider"], registry=r)
         self.fallbacks = Counter(
@@ -72,13 +78,20 @@ class Metrics:
 tracer = trace.get_tracer("llm-gateway")
 
 
-def setup_tracing(service_name: str, otlp_endpoint: str | None) -> None:
+def setup_tracing(service_name: str, otlp_endpoint: str | None, sample_ratio: float = 1.0) -> None:
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
 
     if isinstance(trace.get_tracer_provider(), TracerProvider):
         return
-    provider = TracerProvider(resource=Resource.create({"service.name": service_name}))
+    from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
+
+    # Head sampling keeps span export (encoding runs in a background thread and holds the GIL)
+    # from stalling the event loop at high request rates. Upstream sampling decisions are respected.
+    provider = TracerProvider(
+        resource=Resource.create({"service.name": service_name}),
+        sampler=ParentBased(TraceIdRatioBased(sample_ratio)),
+    )
     if otlp_endpoint:
         from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
