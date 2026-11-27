@@ -19,12 +19,24 @@ from __future__ import annotations
 import asyncio
 import json as jsonlib
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
-from typing import Any
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from typing import Any, Protocol
 from urllib.parse import urlsplit
 from urllib.request import getproxies, proxy_bypass
 
 import httpx
+
+
+class HttpClient(Protocol):
+    """What provider adapters need from an HTTP client. Satisfied by AiohttpClient and httpx.AsyncClient."""
+
+    async def post(self, url: str, *, json: Any, headers: dict[str, str], timeout: float) -> Any: ...
+
+    def stream(
+        self, method: str, url: str, *, json: Any, headers: dict[str, str], timeout: float
+    ) -> AbstractAsyncContextManager[Any]: ...
+
+    async def aclose(self) -> None: ...
 
 
 class HttpResponse:

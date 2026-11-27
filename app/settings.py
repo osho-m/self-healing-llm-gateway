@@ -8,6 +8,14 @@ from typing import Literal
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+_PLACEHOLDER_MARKERS = ("change-me", "changeme", "demo", "example", "placeholder", "test-admin")
+
+
+def is_placeholder_secret(value: str) -> bool:
+    """True for values copied from docs/examples (e.g. demo-admin-key-change-me-0000)."""
+    lowered = value.lower()
+    return any(marker in lowered for marker in _PLACEHOLDER_MARKERS)
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="GATEWAY_", env_file=".env", extra="ignore")
@@ -38,6 +46,11 @@ class Settings(BaseSettings):
         if self.environment == "production":
             if not self.admin_api_key or len(self.admin_api_key) < 24:
                 raise ValueError("GATEWAY_ADMIN_API_KEY (>=24 chars) is required in production")
+            if is_placeholder_secret(self.admin_api_key):
+                raise ValueError(
+                    "GATEWAY_ADMIN_API_KEY looks like a documented placeholder; generate one with "
+                    'python -c "import secrets; print(secrets.token_urlsafe(32))"'
+                )
             if not self.redis_url:
                 raise ValueError("GATEWAY_REDIS_URL is required in production (in-memory stores are per-process)")
         return self
