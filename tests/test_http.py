@@ -127,12 +127,50 @@ async def test_redirects_are_not_followed_so_credentials_stay_put(monkeypatch):
         await srv.close()
 
 
-async def test_session_trusts_proxy_environment():
+async def test_proxy_env_is_honoured_without_netrc(monkeypatch, tmp_path):
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
+    monkeypatch.setenv("NO_PROXY", "internal.example")
+    # A .netrc entry for the provider host must never replace the explicit Bearer header.
+    netrc = tmp_path / ".netrc"
+    netrc.write_text("machine api.openai.com login user password pass\n")
+    monkeypatch.setenv("NETRC", str(netrc))
     client = AiohttpClient()
     try:
-        assert client._get_session().trust_env is True
+        assert client.proxy_for("https://api.openai.com/v1/chat/completions") == "http://proxy.internal:3128"
+        assert client.proxy_for("https://internal.example/v1") is None
+        assert client._get_session().trust_env is False  # .netrc is never consulted
     finally:
         await client.aclose()
+
+
+async def test_bearer_header_reaches_provider_unchanged(monkeypatch, tmp_path):
+    seen = []
+
+    async def capture(request: web.Request) -> web.Response:
+        seen.append(request.headers.get("Authorization"))
+        return web.json_response({"choices": [{"message": {"content": "ok"}}], "usage": {}})
+
+    app = web.Application()
+    app.router.add_post("/capture/chat/completions", capture)
+    server = TestServer(app)
+    await server.start_server()
+    host = server.make_url("").host
+    netrc = tmp_path / ".netrc"
+    netrc.write_text(f"machine {host} login user password pass\n")
+    monkeypatch.setenv("NETRC", str(netrc))
+    monkeypatch.setenv("TEST_KEY", "sk-bearer")
+    client = AiohttpClient()
+    try:
+        cfg = ProviderConfig(
+            name="o", kind="openai", model="m", base_url=str(server.make_url("/capture")), api_key_env="TEST_KEY"
+        )
+        await build_provider(cfg, client).complete(REQ)
+        assert seen == ["Bearer sk-bearer"]
+    finally:
+        await client.aclose()
+        await server.close()
 
 
 @pytest.mark.parametrize("stream", [False, True])

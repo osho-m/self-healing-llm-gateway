@@ -21,7 +21,8 @@ import json as jsonlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
-from urllib.request import getproxies
+from urllib.parse import urlsplit
+from urllib.request import getproxies, proxy_bypass
 
 import httpx
 
@@ -81,6 +82,19 @@ class AiohttpClient:
         self.max_connections, self.max_per_host = max_connections, max_per_host
         self._session = None
         _reject_https_scheme_proxies()
+        # Resolve HTTP(S)_PROXY / NO_PROXY ourselves instead of aiohttp's trust_env, which also applies
+        # .netrc credentials (and in some versions lets them replace an explicit Authorization header).
+        self._proxies = {k: v for k, v in getproxies().items() if k in ("http", "https")}
+        self._proxy_cache: dict[tuple[str, str], str | None] = {}
+
+    def proxy_for(self, url: str) -> str | None:
+        """Proxy URL for a request, honouring NO_PROXY (same semantics as httpx/urllib)."""
+        parts = urlsplit(url)
+        key = (parts.scheme, parts.hostname or "")
+        if key not in self._proxy_cache:
+            proxy = self._proxies.get(parts.scheme)
+            self._proxy_cache[key] = None if not proxy or proxy_bypass(parts.hostname or "") else proxy
+        return self._proxy_cache[key]
 
     def _get_session(self):
         if self._session is None or self._session.closed:
@@ -89,8 +103,7 @@ class AiohttpClient:
             connector = aiohttp.TCPConnector(
                 limit=self.max_connections, limit_per_host=self.max_per_host, ttl_dns_cache=300, keepalive_timeout=30
             )
-            # trust_env: honour HTTPS_PROXY/NO_PROXY like httpx did (aiohttp ignores them by default).
-            self._session = aiohttp.ClientSession(connector=connector, raise_for_status=False, trust_env=True)
+            self._session = aiohttp.ClientSession(connector=connector, raise_for_status=False, trust_env=False)
         return self._session
 
     async def post(self, url: str, *, json: Any, headers: dict[str, str], timeout: float) -> HttpResponse:
@@ -103,6 +116,7 @@ class AiohttpClient:
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=timeout),
                 allow_redirects=False,
+                proxy=self.proxy_for(url),
             ) as resp:
                 if 300 <= resp.status < 400:
                     # Redirects are rejected by status alone; never wait on a (possibly stalled) body.
@@ -121,7 +135,13 @@ class AiohttpClient:
         client_timeout = aiohttp.ClientTimeout(total=None, connect=timeout, sock_read=timeout)
         try:
             async with self._get_session().request(
-                method, url, json=json, headers=headers, timeout=client_timeout, allow_redirects=False
+                method,
+                url,
+                json=json,
+                headers=headers,
+                timeout=client_timeout,
+                allow_redirects=False,
+                proxy=self.proxy_for(url),
             ) as resp:
                 yield StreamResponse(resp)
         except (TimeoutError, aiohttp.ClientError) as exc:
