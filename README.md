@@ -48,7 +48,7 @@ All numbers are measured. [docs/benchmarks.md](docs/benchmarks.md) explains how.
 | Performance fix | 83 to 463 requests per second on the same 2-vCPU machine, after finding and replacing a slow HTTP client |
 | Real outage (local Ollama process killed) | Connection errors opened the circuit and the fallback answered. The circuit closed again once Ollama was back ([details](docs/real-model-run.md)) |
 | Live demo with a real model | Qwen2.5-1.5B-Instruct on a free Hugging Face GPU answered through the gateway in about 0.8 s (2.9 s on the first request). During a simulated outage another model answered instead |
-| Tests | 103 tests on Python 3.11 to 3.13 against a real Redis, with ruff and mypy clean |
+| Tests | 104 tests on Python 3.11 to 3.13 against a real Redis, with ruff and mypy clean |
 
 ## How a request flows
 
@@ -106,6 +106,14 @@ python -m venv .venv && . .venv/bin/activate        # Windows: .venv\Scripts\Act
 pip install -e '.[dev]'
 GATEWAY_POLICY_PATH=config/policy.ollama.yml GATEWAY_ADMIN_API_KEY=local-admin-key-0123456789 \
   uvicorn app.main:app_factory --factory --reload
+```
+
+On Windows PowerShell, set the variables first, then start the gateway:
+
+```powershell
+$env:GATEWAY_POLICY_PATH = "config/policy.ollama.yml"
+$env:GATEWAY_ADMIN_API_KEY = "local-admin-key-0123456789"
+uvicorn app.main:app_factory --factory --reload
 ```
 
 Without `GATEWAY_REDIS_URL` the gateway keeps its counters in memory. That is fine for one copy in development; production mode requires Redis.

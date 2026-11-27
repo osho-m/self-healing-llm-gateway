@@ -145,3 +145,36 @@ async def test_timed_out_model_stays_unavailable_until_its_worker_exits():
     finally:
         release.set()
         unregister_local_model("test/stuck")
+
+
+async def test_two_stuck_workers_both_keep_the_model_unavailable():
+    import asyncio
+    import threading
+
+    gates = [threading.Event(), threading.Event()]
+    calls = []
+
+    def stuck(messages, max_tokens):
+        gate = gates[len(calls)]
+        calls.append(1)
+        gate.wait(5)
+        return LocalGeneration("late", 1, 1)
+
+    register_local_model("test/two-stuck", stuck)
+    p = provider("test/two-stuck", timeout_s=0.05)
+    try:
+        await asyncio.gather(p.complete(REQ), p.complete(REQ), return_exceptions=True)
+        assert len(calls) == 2 and not p.is_available()
+        gates[1].set()  # the second worker finishes first
+        await asyncio.sleep(0.1)
+        assert not p.is_available()  # the first is still running
+        gates[0].set()
+        for _ in range(100):
+            if p.is_available():
+                break
+            await asyncio.sleep(0.01)
+        assert p.is_available()
+    finally:
+        for g in gates:
+            g.set()
+        unregister_local_model("test/two-stuck")

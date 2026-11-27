@@ -35,18 +35,19 @@ class LocalGeneration:
 GenerateFn = Callable[[list[dict[str, str]], int], LocalGeneration]
 
 _REGISTRY: dict[str, GenerateFn] = {}
-# model -> "worker finished" event, for generations that timed out but are still running.
-_STALLED: dict[str, threading.Event] = {}
+# model -> "worker finished" events, one per generation that timed out while running.
+_STALLED: dict[str, list[threading.Event]] = {}
 _LOCK = threading.Lock()
 
 
 def _stalled(model: str) -> bool:
     with _LOCK:
-        done = _STALLED.get(model)
-        if done is not None and done.is_set():
-            del _STALLED[model]
-            return False
-        return done is not None
+        pending = [done for done in _STALLED.get(model, []) if not done.is_set()]
+        if pending:
+            _STALLED[model] = pending
+            return True
+        _STALLED.pop(model, None)
+        return False
 
 
 def register_local_model(model: str, generate: GenerateFn) -> None:
@@ -70,9 +71,10 @@ class LocalModelProvider(Provider):
         model = self.config.model
         if _stalled(model):
             raise ProviderError(self.name, "busy", "an earlier generation is still running", retryable=True)
-        done = threading.Event()
+        started, done = threading.Event(), threading.Event()
 
         def run() -> LocalGeneration:
+            started.set()
             try:
                 return generate(request.messages, request.max_tokens)
             finally:
@@ -83,8 +85,9 @@ class LocalModelProvider(Provider):
             out = await asyncio.wait_for(asyncio.to_thread(run), timeout=self.config.timeout_s)
         except TimeoutError as exc:
             with _LOCK:
-                if not done.is_set():
-                    _STALLED[model] = done  # unavailable until this worker exits
+                # A call cancelled while still queued never runs, so it must not block the model.
+                if started.is_set() and not done.is_set():
+                    _STALLED.setdefault(model, []).append(done)  # unavailable until every such worker exits
             raise ProviderError(self.name, "timeout", "local generation timed out", retryable=True) from exc
         except Exception as exc:
             # Runtime failures (GPU quota exhausted, out of memory, device errors) are transient from
