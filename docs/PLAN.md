@@ -30,7 +30,7 @@ The specification is *Project 11: LLM Gateway with Rate Limiting, Fallback Routi
 | 4.3 | Three Grafana dashboards | `scripts/gen_dashboards.py` → `deploy/grafana/dashboards` | CI regenerates and diffs |
 | 4.4 | Alert rules routed to Slack | `deploy/prometheus/alerts.yml`, `deploy/alertmanager` | CI `promtool` / `amtool` |
 | 5.1 | Integration tests: limits under concurrency, budgets, fallback, breakers, streaming | `tests/` | CI, Python 3.11–3.13 with Redis |
-| 5.2 | Load test with 5,000+ concurrent mixed requests; overhead under 10 ms | `loadtests/loadtest.py` (closed-loop capacity + open-loop `--rate`), `loadtests/gateway.js` | CI `compose-smoke`: capacity 296–463 req/s. At 100 req/s, overhead p50 was 1.7–3.8 ms in every run, while p95 (3.9–12.1 ms) and p99 met 10 ms in only some runs; 25 ms p95 regression guard. **10 ms SLO not yet verified on dedicated hardware.** See README |
+| 5.2 | Load test with 5,000+ concurrent mixed requests; overhead under 10 ms | `loadtests/loadtest.py` (closed-loop capacity + open-loop `--rate`), `loadtests/gateway.js` | CI `compose-smoke` on a 4-vCPU runner with real Redis: up to 630 req/s capacity; overhead at 100 req/s p50/p95/p99 1.6–1.8 / 2.4–3.0 / 2.5–4.7 ms over two runs, so **under 10 ms at p99**. A 25 ms p95 regression guard stays in place for noisy runners. See README |
 | 5.3 | Compose: gateway, Redis, Prometheus, Grafana, mock providers, demo teams | `docker-compose.yml`, `config/policy.compose.yml` | CI `compose-smoke` |
 | 6 | Demo script and narrative | `scripts/demo.ps1`, `scripts/demo.sh`, README | manual |
 
