@@ -71,6 +71,7 @@ async def main() -> None:
     ap.add_argument("--concurrency", type=int, default=500)
     ap.add_argument("--outage", action="store_true", help="simulate a mock-primary outage halfway through")
     ap.add_argument("--admin-key", default="demo-admin-key-change-me-0000")
+    ap.add_argument("--max-overhead-p95-ms", type=float, help="exit 1 if gateway overhead p95 exceeds this")
     ap.add_argument("--max-overhead-p99-ms", type=float, help="exit 1 if gateway overhead p99 exceeds this")
     ap.add_argument(
         "--rate",
@@ -96,7 +97,9 @@ async def main() -> None:
             ) as r:
                 r.raise_for_status()
 
-        before = histogram(await metrics_text(), "gateway_overhead_seconds")
+        text = await metrics_text()
+        before = histogram(text, "gateway_overhead_seconds")
+        store_before = histogram(text, "gateway_store_duration_seconds")
         statuses: Counter[str] = Counter()
         providers: Counter[str] = Counter()
         latencies: list[float] = []
@@ -134,9 +137,19 @@ async def main() -> None:
         wall = time.perf_counter() - t0
         if args.outage:
             await set_outage(False)
-        after = histogram(await metrics_text(), "gateway_overhead_seconds")
+        text = await metrics_text()
+        after = histogram(text, "gateway_overhead_seconds")
+        store_after = histogram(text, "gateway_store_duration_seconds")
 
     over = diff(after, before)
+    store = diff(store_after, store_before)
+
+    def hist_ms(buckets):
+        return {
+            f"p{int(q * 100)}": (round(v * 1000, 2) if (v := quantile(buckets, q)) is not None else None)
+            for q in (0.5, 0.95, 0.99)
+        }
+
     latencies.sort()
 
     def pct(q):
@@ -156,15 +169,15 @@ async def main() -> None:
             "p99": pct(0.99),
             "mean": round(statistics.fmean(latencies) * 1000, 1) if latencies else None,
         },
-        "gateway_overhead_ms": {
-            f"p{int(q * 100)}": (round(v * 1000, 2) if (v := quantile(over, q)) is not None else None)
-            for q in (0.5, 0.95, 0.99)
-        },
+        "gateway_overhead_ms": hist_ms(over),
+        # Part of the overhead: state-store calls on the request path (Redis round trips in compose).
+        "store_call_ms": hist_ms(store),
     }
     print(json.dumps(report, indent=2))
-    p99 = report["gateway_overhead_ms"]["p99"]
-    if args.max_overhead_p99_ms is not None and (p99 is None or p99 > args.max_overhead_p99_ms):
-        raise SystemExit(f"gateway overhead p99 {p99} ms exceeds {args.max_overhead_p99_ms} ms")
+    for q, limit in (("p95", args.max_overhead_p95_ms), ("p99", args.max_overhead_p99_ms)):
+        value = report["gateway_overhead_ms"][q]
+        if limit is not None and (value is None or value > limit):
+            raise SystemExit(f"gateway overhead {q} {value} ms exceeds {limit} ms")
 
 
 if __name__ == "__main__":

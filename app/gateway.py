@@ -147,7 +147,7 @@ class Gateway:
         token_need = prompt_est + req.max_tokens
 
         estimate = self._max_cost(req.model, prompt_est, req.max_tokens)
-        with tracer.start_as_current_span("gateway.admission") as span:
+        with tracer.start_as_current_span("gateway.admission") as span, self.metrics.store_duration.time():
             decision, budget = await self.store.admit(
                 team.team_id,
                 team.requests_per_minute,
@@ -309,7 +309,8 @@ class Gateway:
     ) -> tuple[float, float, dict]:
         team = adm.team
         cost = self.policy.provider(provider).cost_usd(prompt_t, completion_t)
-        spent = await self.store.settle_budget(team.team_id, adm.reserved_usd, cost)
+        with self.metrics.store_duration.time():
+            spent = await self.store.settle_budget(team.team_id, adm.reserved_usd, cost)
         utilization = spent / team.daily_budget_usd if team.daily_budget_usd else 1.0
         self.metrics.tokens.labels(team.team_id, provider, "input").inc(prompt_t)
         self.metrics.tokens.labels(team.team_id, provider, "output").inc(completion_t)

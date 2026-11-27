@@ -45,6 +45,12 @@ class Metrics:
         self.overhead = Histogram(
             "gateway_overhead_seconds", "Gateway time excluding provider calls", buckets=OVERHEAD_BUCKETS, registry=r
         )
+        self.store_duration = Histogram(
+            "gateway_store_duration_seconds",
+            "Request-path state store calls (admission + settlement)",
+            buckets=OVERHEAD_BUCKETS,
+            registry=r,
+        )
         self.tokens = Counter("gateway_tokens_total", "Tokens processed", ["team", "provider", "direction"], registry=r)
         self.cost = Counter("gateway_cost_usd_total", "Spend in USD", ["team", "provider"], registry=r)
         self.fallbacks = Counter(
