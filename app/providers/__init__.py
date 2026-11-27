@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import httpx
-
+from app.http import HttpClient
 from app.policy import ProviderConfig
 from app.providers.anthropic import AnthropicProvider
 from app.providers.base import (
@@ -25,7 +24,7 @@ _KINDS: dict[str, type[Provider]] = {
 }
 
 
-def build_provider(config: ProviderConfig, client: httpx.AsyncClient) -> Provider:
+def build_provider(config: ProviderConfig, client: HttpClient) -> Provider:
     return _KINDS[config.kind](config, client)
 
 

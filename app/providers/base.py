@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 
 import httpx
 
+from app.http import HttpClient
 from app.policy import ProviderConfig
 
 RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504, 529}
@@ -80,7 +81,7 @@ class StreamChunk:
 
 
 class Provider(ABC):
-    def __init__(self, config: ProviderConfig, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(self, config: ProviderConfig, client: HttpClient | None = None) -> None:
         self.config = config
         self.name = config.name
         self.client = client

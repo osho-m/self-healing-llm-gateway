@@ -146,17 +146,26 @@ OVERRIDABLE_FIELDS = {
 }
 
 
-def load_policy_file(path: str | Path) -> Policy:
+def load_policy_file(path: str | Path, *, forbid_plaintext_keys: bool = False) -> Policy:
     with open(path, encoding="utf-8") as fh:
-        return Policy.model_validate(yaml.safe_load(fh))
+        raw = yaml.safe_load(fh)
+    if forbid_plaintext_keys:
+        offenders = [t.get("team_id", "?") for t in (raw or {}).get("teams", []) if t.get("api_keys")]
+        if offenders:
+            raise ValueError(
+                f"plaintext api_keys are not allowed in production (teams: {offenders}); "
+                "store api_key_sha256 hashes instead (python scripts/hash_key.py)"
+            )
+    return Policy.model_validate(raw)
 
 
 class PolicyManager:
     """Holds the effective policy: YAML file + runtime overrides, with mtime-based hot reload."""
 
-    def __init__(self, path: str | Path, policy: Policy | None = None) -> None:
+    def __init__(self, path: str | Path, policy: Policy | None = None, *, forbid_plaintext_keys: bool = False) -> None:
+        self.forbid_plaintext_keys = forbid_plaintext_keys
         self.path = Path(path)
-        self._base = policy or load_policy_file(self.path)
+        self._base = policy or load_policy_file(self.path, forbid_plaintext_keys=forbid_plaintext_keys)
         self._mtime = self.path.stat().st_mtime if self.path.exists() else 0.0
         self._overrides: dict[str, dict[str, Any]] = {}
         self.version = 1
@@ -218,7 +227,7 @@ class PolicyManager:
         if mtime == self._mtime:
             return False
         try:
-            base = load_policy_file(self.path)
+            base = load_policy_file(self.path, forbid_plaintext_keys=self.forbid_plaintext_keys)
         except Exception:
             log.exception("policy reload rejected; keeping last good policy", extra={"path": str(self.path)})
             self._mtime = mtime

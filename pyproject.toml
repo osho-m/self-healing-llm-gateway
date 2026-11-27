@@ -25,7 +25,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6", "pytest-cov>=5"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6", "pytest-cov>=5", "mypy>=1.11", "types-PyYAML"]
 space = ["gradio>=5.0,<7.0"]
 
 [tool.setuptools.packages.find]
@@ -43,6 +43,12 @@ ignore = ["S101", "S311", "B008"]
 "tests/*" = ["S105", "S106"]
 "scripts/*" = ["S"]
 "app/http.py" = ["ASYNC109"]  # mirrors the httpx client signature on purpose
+
+[tool.mypy]
+python_version = "3.11"
+files = ["app"]
+ignore_missing_imports = true
+warn_unused_ignores = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import threading
+from collections import OrderedDict
+
 import gradio as gr
 
 from app.audit import AuditLog
@@ -26,12 +29,35 @@ if spaces is not None:
 
 
 policy = PolicyManager("config/policy.example.yml")
-gateway = Gateway(policy, MemoryStore(), Metrics(), AuditLog(None))
 DEMO_TEAM = policy.team("demo")
 PRIMARY = "mock-primary"
+MAX_SESSIONS = 256
+
+# One gateway (limits, budgets, circuits, fault switches) per browser session, so one visitor's
+# outage toggle or rate-limit usage never affects another. Least recently used sessions are evicted.
+_sessions: OrderedDict[str, Gateway] = OrderedDict()
+# Gradio runs sync handlers in worker threads and async ones on the event loop.
+_sessions_lock = threading.Lock()
 
 
-def health() -> dict:
+def _new_gateway() -> Gateway:
+    return Gateway(policy, MemoryStore(), Metrics(), AuditLog(None))
+
+
+def gateway_for(request: gr.Request | None) -> Gateway:
+    key = getattr(request, "session_hash", None) or "local"
+    with _sessions_lock:
+        gateway = _sessions.get(key)
+        if gateway is None:
+            gateway = _sessions[key] = _new_gateway()
+            if len(_sessions) > MAX_SESSIONS:
+                _sessions.popitem(last=False)
+        else:
+            _sessions.move_to_end(key)
+    return gateway
+
+
+def health(gateway: Gateway) -> dict:
     report = gateway.health_report()
     return {
         name: {k: info[k] for k in ("status", "circuit", "error_rate", "p99_ms", "simulated_outage")}
@@ -39,32 +65,35 @@ def health() -> dict:
     }
 
 
-async def send_request(prompt: str, tier: str, priority: str) -> tuple[str, dict, dict]:
+async def send_request(prompt: str, tier: str, priority: str, request: gr.Request) -> tuple[str, dict, dict]:
+    gateway = gateway_for(request)
     if not prompt or not prompt.strip():
-        return "Enter a prompt to send through the gateway.", {}, health()
+        return "Enter a prompt to send through the gateway.", {}, health(gateway)
     req = ChatRequest(model=tier, messages=[ChatMessage(role="user", content=prompt.strip())], priority=priority)
     try:
         adm = await gateway.admit(DEMO_TEAM, req)
         resp, headers = await gateway.complete(adm)
     except GatewayError as exc:
-        return f"Gateway error {exc.status_code} ({exc.code}): {exc.message}", exc.headers, health()
+        return f"Gateway error {exc.status_code} ({exc.code}): {exc.message}", exc.headers, health(gateway)
     meta = resp.x_gateway.model_dump() | {"usage": resp.usage.model_dump(), "headers": headers}
-    return resp.choices[0].message.content, meta, health()
+    return resp.choices[0].message.content, meta, health(gateway)
 
 
-def set_primary_outage(enabled: bool) -> tuple[str, dict]:
+def set_primary_outage(enabled: bool, request: gr.Request) -> tuple[str, dict]:
+    gateway = gateway_for(request)
     gateway.faults.set(PRIMARY, outage=enabled)
     msg = (
         "OUTAGE ENABLED: requests retry with backoff, the circuit opens, traffic fails over."
         if enabled
         else "Primary restored: after the cooldown the circuit goes half-open and one probe closes it."
     )
-    return msg, health()
+    return msg, health(gateway)
 
 
-async def run_probe() -> dict:
+async def run_probe(request: gr.Request) -> dict:
+    gateway = gateway_for(request)
     await gateway.probe_all()
-    return health()
+    return health(gateway)
 
 
 with gr.Blocks(title="Self-Healing LLM Gateway") as demo:
@@ -73,7 +102,7 @@ with gr.Blocks(title="Self-Healing LLM Gateway") as demo:
     # Self-Healing LLM Gateway
     The same engine as the FastAPI service: per-team rate limits and budgets, retries with
     exponential backoff, circuit breakers, and tier-based failover. Providers here are deterministic
-    in-process mocks, so no external API key is used.
+    in-process mocks, so no external API key is used. Each visitor gets an isolated gateway.
     """
     )
     with gr.Row():
@@ -90,7 +119,7 @@ with gr.Blocks(title="Self-Healing LLM Gateway") as demo:
             answer = gr.Textbox(label="Gateway response", lines=6)
             metadata = gr.JSON(label="Routing, cost and budget metadata")
             status = gr.Textbox(label="Resilience status")
-            health_view = gr.JSON(label="Provider health / circuit state", value=health())
+            health_view = gr.JSON(label="Provider health / circuit state", value=health(_new_gateway()))
     send.click(send_request, inputs=[prompt, tier, priority], outputs=[answer, metadata, health_view])
     outage.change(set_primary_outage, inputs=outage, outputs=[status, health_view])
     probe.click(run_probe, outputs=health_view)
