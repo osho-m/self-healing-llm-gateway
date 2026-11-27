@@ -1,4 +1,5 @@
 import json
+import re
 import time
 
 import httpx
@@ -281,3 +282,14 @@ def test_metrics_and_health_endpoints(client):
 
 def test_base_policy_unchanged_by_tests():
     assert BASE_POLICY["teams"][0]["requests_per_minute"] == 1000
+
+
+def test_stream_overhead_excludes_provider_time(make_client):
+    data = policy_dict()
+    data["providers"][0]["mock_latency_ms"] = 200
+    client = make_client(data)
+    assert chat(client, stream=True).status_code == 200
+    metrics = client.get("/metrics").text
+    count = float(re.search(r"^gateway_overhead_seconds_count ([0-9.e+]+)$", metrics, re.M).group(1))
+    total = float(re.search(r"^gateway_overhead_seconds_sum ([0-9.e+]+)$", metrics, re.M).group(1))
+    assert count == 1 and total < 0.1
