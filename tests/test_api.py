@@ -347,3 +347,36 @@ def test_production_refuses_tier_without_configured_provider(policy_file, monkey
     )
     with pytest.raises(ValueError, match="no configured provider"):
         create_app(settings, policy=PolicyManager(policy_file(data), forbid_plaintext_keys=True))
+
+
+def test_admission_reserves_provider_max_tokens_floor(make_client, monkeypatch):
+    monkeypatch.setenv("SET_CLAUDE_KEY", "sk-test")
+    data = policy_dict()
+    data["providers"].insert(
+        0,
+        {"name": "claude", "kind": "anthropic", "model": "m", "api_key_env": "SET_CLAUDE_KEY", "min_max_tokens": 1024},
+    )
+    data["tiers"]["balanced"] = ["claude", "primary"]
+    data["teams"][0]["tokens_per_minute"] = 1000
+    client = make_client(data)
+    # The client asks for 1 token, but the provider would raise it to 1024: admission must count 1024.
+    r = chat(client, max_tokens=1)
+    assert r.status_code == 429 and "1000/min" in r.json()["error"]["message"]
+
+
+async def test_retired_adapter_closes_only_after_in_flight_calls_finish():
+    from app.policy import ProviderConfig
+    from app.providers.mock import MockProvider
+
+    closed = []
+
+    class Tracked(MockProvider):
+        async def aclose(self):
+            closed.append(True)
+
+    p = Tracked(ProviderConfig(name="m", kind="mock"))
+    p.acquire()
+    await p.retire()
+    assert closed == []  # still in use
+    await p.release()
+    assert closed == [True]

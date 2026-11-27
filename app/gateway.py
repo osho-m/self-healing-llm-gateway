@@ -109,7 +109,7 @@ class Gateway:
             loop = asyncio.get_running_loop()
         except RuntimeError:  # no running loop (startup or tests); nothing to schedule on
             return
-        task = loop.create_task(provider.aclose())
+        task = loop.create_task(provider.retire())
         _BACKGROUND_TASKS.add(task)
         task.add_done_callback(_BACKGROUND_TASKS.discard)
 
@@ -155,8 +155,17 @@ class Gateway:
             messages.insert(0, {"role": "system", "content": cfg.system_prompt})
         return messages
 
+    def _chain_configs(self, tier: str) -> list:
+        """Providers that can actually serve this tier (falls back to all if none are configured)."""
+        chain = [self.policy.provider(p) for p in self.policy.tiers[tier]]
+        return [c for c in chain if c.is_configured()] or chain
+
     def _max_cost(self, tier: str, prompt_tokens: int, max_tokens: int) -> float:
-        return max(self.policy.provider(p).cost_usd(prompt_tokens, max_tokens) for p in self.policy.tiers[tier])
+        # Each provider may raise max_tokens to its floor (min_max_tokens); reserve for that.
+        return max(c.cost_usd(prompt_tokens, max(max_tokens, c.min_max_tokens)) for c in self._chain_configs(tier))
+
+    def _max_output_tokens(self, tier: str, max_tokens: int) -> int:
+        return max(max(max_tokens, c.min_max_tokens) for c in self._chain_configs(tier))
 
     async def admit(self, team: TeamPolicy, req: ChatRequest) -> Admission:
         started = time.perf_counter()
@@ -167,7 +176,7 @@ class Gateway:
             raise GatewayError(403, "tier_not_allowed", f"Team {team.team_id!r} may not use tier {req.model!r}.")
         messages = self._enrich(team, req)
         prompt_est = sum(estimate_tokens(m["content"]) for m in messages)
-        token_need = prompt_est + req.max_tokens
+        token_need = prompt_est + self._max_output_tokens(req.model, req.max_tokens)
 
         estimate = self._max_cost(req.model, prompt_est, req.max_tokens)
         with tracer.start_as_current_span("gateway.admission") as span, self.metrics.store_duration.time():
@@ -217,7 +226,12 @@ class Gateway:
             await asyncio.sleep(fault.latency_ms / 1000)
         if fault.outage:
             raise ProviderError(name, "server_error", "simulated outage", retryable=True, status=503)
-        return await self.providers[name].complete(creq)
+        adapter = self.providers[name]
+        adapter.acquire()
+        try:
+            return await adapter.complete(creq)
+        finally:
+            await adapter.release()
 
     def _backoff(self, attempt: int) -> float:
         res = self.policy.resilience
@@ -380,20 +394,26 @@ class Gateway:
 
     async def _open_stream(
         self, name: str, creq: CompletionRequest
-    ) -> tuple[list[StreamChunk], AsyncIterator[StreamChunk]]:
+    ) -> tuple[list[StreamChunk], AsyncIterator[StreamChunk], Provider]:
         """Start a provider stream and buffer until the first content delta, so failover stays invisible."""
         fault = self.faults.get(name)
         if fault.latency_ms:
             await asyncio.sleep(fault.latency_ms / 1000)
         if fault.outage:
             raise ProviderError(name, "server_error", "simulated outage", retryable=True, status=503)
-        agen = self.providers[name].stream(creq).__aiter__()
-        buffered: list[StreamChunk] = []
-        async for chunk in agen:
-            buffered.append(chunk)
-            if chunk.delta or chunk.finish_reason:
-                break
-        return buffered, agen
+        adapter = self.providers[name]
+        adapter.acquire()  # released by _sse when the stream ends, or below if opening fails
+        try:
+            agen = adapter.stream(creq).__aiter__()
+            buffered: list[StreamChunk] = []
+            async for chunk in agen:
+                buffered.append(chunk)
+                if chunk.delta or chunk.finish_reason:
+                    break
+        except BaseException:
+            await adapter.release()
+            raise
+        return buffered, agen, adapter
 
     async def stream(self, adm: Admission) -> tuple[str, AsyncIterator[bytes]]:
         res, tier = self.policy.resilience, adm.req.model
@@ -409,7 +429,7 @@ class Gateway:
             for attempt in range(res.max_retries + 1):
                 t0 = time.perf_counter()
                 try:
-                    buffered, agen = await self._open_stream(name, adm.creq)
+                    buffered, agen, adapter = await self._open_stream(name, adm.creq)
                 except ProviderError as err:
                     elapsed = time.perf_counter() - t0
                     adm.provider_time += elapsed
@@ -431,7 +451,7 @@ class Gateway:
                 adm.provider_time += time.perf_counter() - t0
                 if idx > 0:
                     self.metrics.fallbacks.labels(tier, chain[0], name).inc()
-                return name, self._sse(adm, name, buffered, agen, t0)
+                return name, self._sse(adm, name, buffered, agen, t0, adapter)
         await self.store.settle_budget(adm.team.team_id, adm.reserved_usd, 0.0)
         self.metrics.requests.labels(adm.team.team_id, tier, "none", "503", adm.req.priority).inc()
         raise GatewayError(
@@ -442,7 +462,13 @@ class Gateway:
         )
 
     async def _sse(
-        self, adm: Admission, provider: str, buffered: list[StreamChunk], agen: AsyncIterator[StreamChunk], t0: float
+        self,
+        adm: Admission,
+        provider: str,
+        buffered: list[StreamChunk],
+        agen: AsyncIterator[StreamChunk],
+        t0: float,
+        adapter: Provider,
     ) -> AsyncIterator[bytes]:
         tier, team = adm.req.model, adm.team
         rid = f"chatcmpl-{adm.request_id}"
@@ -522,6 +548,7 @@ class Gateway:
             }
             yield f"data: {json.dumps(err_body)}\n\n".encode()
         finally:
+            await adapter.release()
             self.metrics.inflight.dec()
             if not settled:
                 # Charge what was delivered (estimate) so aborted streams are not free.

@@ -16,7 +16,9 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Any
 
+import aiohttp
 import anthropic
+import httpx2
 
 from app.providers.base import (
     CompletionRequest,
@@ -26,6 +28,15 @@ from app.providers.base import (
     StreamChunk,
     error_from_status,
 )
+
+# Error types the API reports inside an HTTP-200 event stream that are worth retrying elsewhere.
+_RETRYABLE_STREAM_ERRORS = {
+    "overloaded_error": "server_error",
+    "api_error": "server_error",
+    "rate_limit_error": "rate_limited",
+    "timeout_error": "timeout",
+}
+_TRANSPORT_ERRORS = (anthropic.AnthropicError, httpx2.TransportError, aiohttp.ClientError, TimeoutError)
 
 _FINISH = {"end_turn": "stop", "stop_sequence": "stop", "max_tokens": "length", "tool_use": "tool_calls"}
 
@@ -46,7 +57,8 @@ class AnthropicProvider(Provider):
                 base_url=self.config.base_url or None,
                 max_retries=0,
                 timeout=self.config.timeout_s,
-                http_client=anthropic.DefaultAioHttpClient(),
+                # Never follow redirects: a 307/308 would resend the full prompt to the target.
+                http_client=anthropic.DefaultAioHttpClient(follow_redirects=False),
             )
         return self._sdk
 
@@ -75,7 +87,19 @@ class AnthropicProvider(Provider):
         if isinstance(exc, anthropic.APIConnectionError):
             return ProviderError(self.name, "connection", str(exc) or "connection error", retryable=True)
         if isinstance(exc, anthropic.APIStatusError):
+            if exc.status_code < 300:
+                # An error event inside a successful (200) stream: classify by its structured type.
+                error_type = getattr(exc, "type", None) or ""
+                kind = _RETRYABLE_STREAM_ERRORS.get(error_type)
+                if kind:
+                    return ProviderError(self.name, kind, error_type, retryable=True)
+                return ProviderError(self.name, error_type or "stream_error", str(exc.message), retryable=False)
             return error_from_status(self.name, exc.status_code, str(exc.message))
+        # Transport failures the SDK passes through unchanged (mostly during stream iteration).
+        if isinstance(exc, (httpx2.TimeoutException, TimeoutError)):
+            return ProviderError(self.name, "timeout", str(exc) or "timeout", retryable=True)
+        if isinstance(exc, (httpx2.TransportError, aiohttp.ClientError)):
+            return ProviderError(self.name, "connection", str(exc) or type(exc).__name__, retryable=True)
         return ProviderError(self.name, "unknown", repr(exc), retryable=False)
 
     def _refusal(self, details: Any) -> ProviderError:
@@ -85,7 +109,7 @@ class AnthropicProvider(Provider):
     async def complete(self, request: CompletionRequest) -> CompletionResult:
         try:
             message = await self._client().messages.create(**self._params(request))
-        except anthropic.AnthropicError as exc:
+        except _TRANSPORT_ERRORS as exc:
             raise self._error(exc) from exc
         if message.stop_reason == "refusal":
             raise self._refusal(message.stop_details)
@@ -116,7 +140,7 @@ class AnthropicProvider(Provider):
                         )
         except ProviderError:
             raise
-        except anthropic.AnthropicError as exc:
+        except _TRANSPORT_ERRORS as exc:
             raise self._error(exc) from exc
 
     async def aclose(self) -> None:

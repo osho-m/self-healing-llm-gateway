@@ -85,6 +85,23 @@ class Provider(ABC):
         self.config = config
         self.name = config.name
         self.client = client
+        self._inflight = 0
+        self._retired = False
+
+    def acquire(self) -> None:
+        """Mark one call in flight. Pair with :meth:`release`."""
+        self._inflight += 1
+
+    async def release(self) -> None:
+        self._inflight -= 1
+        if self._retired and self._inflight == 0:
+            await self.aclose()
+
+    async def retire(self) -> None:
+        """Called when a policy reload replaces or removes this adapter: close once idle."""
+        self._retired = True
+        if self._inflight == 0:
+            await self.aclose()
 
     @abstractmethod
     async def complete(self, request: CompletionRequest) -> CompletionResult: ...
