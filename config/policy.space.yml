@@ -1,0 +1,53 @@
+# Policy for the public Hugging Face Space (demo.py).
+#
+#   zerogpu-qwen   real model, Qwen2.5-1.5B-Instruct (Apache-2.0), run in-process on ZeroGPU.
+#                  Registered by demo.py; skipped when no GPU runtime is present.
+#   claude         optional. Enabled only when the ANTHROPIC_API_KEY Space secret is set.
+#                  No background probes (each probe would be a paid call).
+#   mock-fallback  deterministic last resort, so the demo keeps answering if every real
+#                  provider is down or the visitor's GPU quota is used up.
+#
+# Every visitor shares the demo team's rate limits and daily budget (one store per process).
+providers:
+  - name: zerogpu-qwen
+    kind: local
+    model: Qwen/Qwen2.5-1.5B-Instruct
+    timeout_s: 120
+  - name: claude
+    kind: anthropic
+    model: claude-opus-5-5
+    api_key_env: ANTHROPIC_API_KEY
+    input_price_per_mtok: 4.00
+    output_price_per_mtok: 20.00
+    effort: low
+    min_max_tokens: 1024
+    probe: false
+    timeout_s: 60
+  - name: mock-fallback
+    kind: mock
+    model: mock-small
+
+tiers:
+  balanced: [zerogpu-qwen, claude, mock-fallback]
+  premium: [claude, zerogpu-qwen, mock-fallback]
+  economy: [zerogpu-qwen, mock-fallback]
+
+teams:
+  - team_id: demo
+    name: Public demo
+    api_keys: [demo-live-key]
+    allowed_tiers: [economy, balanced, premium]
+    requests_per_minute: 30
+    tokens_per_minute: 60000
+    daily_budget_usd: 1.0
+    enrichment:
+      system_prompt: "You are a concise assistant behind an LLM gateway. Answer in at most three sentences."
+
+resilience:
+  max_retries: 1
+  backoff_base_s: 0.2
+  backoff_max_s: 1.0
+  circuit_failure_threshold: 2
+  circuit_window_s: 60
+  circuit_cooldown_s: 20
+  health_check_interval_s: 300
