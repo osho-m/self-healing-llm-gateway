@@ -10,11 +10,11 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-
-import httpx
+from typing import Any
 
 from app.audit import AuditLog
 from app.errors import GatewayError
+from app.http import AiohttpClient
 from app.observability import HEALTH_STATUSES, Metrics, tracer
 from app.policy import PolicyManager, TeamPolicy
 from app.providers import CompletionRequest, CompletionResult, Provider, ProviderError, StreamChunk, build_provider
@@ -46,13 +46,12 @@ class Gateway:
         store: Store,
         metrics: Metrics,
         audit: AuditLog,
-        client: httpx.AsyncClient | None = None,
+        client: Any = None,
         sleep=asyncio.sleep,
     ) -> None:
         self.policy_manager, self.store, self.metrics, self.audit = policy, store, metrics, audit
-        self.client = client or httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=500, max_keepalive_connections=100)
-        )
+        # aiohttp in production (scales with concurrency); tests inject httpx clients with MockTransport.
+        self.client = client or AiohttpClient()
         self.faults = FaultInjector()
         self._sleep = sleep
         self.providers: dict[str, Provider] = {}
@@ -147,17 +146,20 @@ class Gateway:
         prompt_est = sum(estimate_tokens(m["content"]) for m in messages)
         token_need = prompt_est + req.max_tokens
 
-        with tracer.start_as_current_span("gateway.rate_limit") as span:
-            decision = await self.store.acquire(
+        estimate = self._max_cost(req.model, prompt_est, req.max_tokens)
+        with tracer.start_as_current_span("gateway.admission") as span, self.metrics.store_duration.time():
+            decision, budget = await self.store.admit(
                 team.team_id,
                 team.requests_per_minute,
                 team.tokens_per_minute,
                 token_need,
                 req.priority,
                 team.batch_reserve_ratio,
+                estimate,
+                team.daily_budget_usd,
             )
             span.set_attribute("gateway.allowed", decision.allowed)
-        if not decision.allowed:
+        if budget is None:
             self.metrics.rate_limited.labels(team.team_id, decision.limit or "unknown", req.priority).inc()
             msg = (
                 f"Rate limit exceeded ({decision.limit} per minute) for team {team.team_id!r}."
@@ -167,11 +169,6 @@ class Gateway:
             if req.priority == "batch":
                 msg += " Batch traffic cannot use the capacity reserved for realtime requests."
             raise GatewayError(429, "rate_limit_exceeded", msg, retry_after=decision.retry_after_s)
-
-        with tracer.start_as_current_span("gateway.budget") as span:
-            estimate = self._max_cost(req.model, prompt_est, req.max_tokens)
-            budget = await self.store.reserve_budget(team.team_id, estimate, team.daily_budget_usd)
-            span.set_attribute("gateway.budget_utilization", budget.utilization)
         self.metrics.budget_spend.labels(team.team_id).set(budget.spent_usd)
         if not budget.allowed:
             self.metrics.rate_limited.labels(team.team_id, "budget", req.priority).inc()
@@ -312,7 +309,8 @@ class Gateway:
     ) -> tuple[float, float, dict]:
         team = adm.team
         cost = self.policy.provider(provider).cost_usd(prompt_t, completion_t)
-        spent = await self.store.settle_budget(team.team_id, adm.reserved_usd, cost)
+        with self.metrics.store_duration.time():
+            spent = await self.store.settle_budget(team.team_id, adm.reserved_usd, cost)
         utilization = spent / team.daily_budget_usd if team.daily_budget_usd else 1.0
         self.metrics.tokens.labels(team.team_id, provider, "input").inc(prompt_t)
         self.metrics.tokens.labels(team.team_id, provider, "output").inc(completion_t)

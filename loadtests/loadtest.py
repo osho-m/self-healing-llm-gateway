@@ -1,6 +1,10 @@
 """Concurrent load test with mixed teams, tiers and priorities; reports measured numbers only.
 
     python loadtests/loadtest.py --url http://localhost:8000 --requests 5000 --concurrency 500 [--outage]
+    python loadtests/loadtest.py --requests 3000 --rate 100     # fixed arrival rate, for latency/overhead SLOs
+
+Closed loop (default) finds capacity: once the gateway saturates, extra in-flight requests wait for CPU
+and that queueing shows up as overhead. Measure the overhead SLO with --rate below capacity.
 
 Gateway overhead is read from the gateway's own `gateway_overhead_seconds` histogram (time spent in the
 gateway excluding provider calls), so it is independent of mock-provider latency.
@@ -17,7 +21,7 @@ import statistics
 import time
 from collections import Counter
 
-import httpx
+import aiohttp
 
 PROFILES = [
     # (weight, key, tier, priority)
@@ -67,11 +71,35 @@ async def main() -> None:
     ap.add_argument("--concurrency", type=int, default=500)
     ap.add_argument("--outage", action="store_true", help="simulate a mock-primary outage halfway through")
     ap.add_argument("--admin-key", default="demo-admin-key-change-me-0000")
+    ap.add_argument("--max-overhead-p95-ms", type=float, help="exit 1 if gateway overhead p95 exceeds this")
+    ap.add_argument("--max-overhead-p99-ms", type=float, help="exit 1 if gateway overhead p99 exceeds this")
+    ap.add_argument(
+        "--rate",
+        type=float,
+        default=0.0,
+        help="open-loop arrival rate in req/s (0 = closed loop: as fast as --concurrency allows)",
+    )
     args = ap.parse_args()
 
-    limits = httpx.Limits(max_connections=args.concurrency, max_keepalive_connections=args.concurrency)
-    async with httpx.AsyncClient(base_url=args.url, timeout=60, limits=limits) as client:
-        before = histogram((await client.get("/metrics")).text, "gateway_overhead_seconds")
+    connector = aiohttp.TCPConnector(limit=args.concurrency)
+    timeout = aiohttp.ClientTimeout(total=120)
+    async with aiohttp.ClientSession(base_url=args.url, connector=connector, timeout=timeout) as client:
+
+        async def metrics_text() -> str:
+            async with client.get("/metrics") as r:
+                return await r.text()
+
+        async def set_outage(enabled: bool) -> None:
+            async with client.post(
+                "/v1/admin/providers/mock-primary/simulate-outage",
+                params={"enabled": str(enabled).lower()},
+                headers={"X-Admin-Key": args.admin_key},
+            ) as r:
+                r.raise_for_status()
+
+        text = await metrics_text()
+        before = histogram(text, "gateway_overhead_seconds")
+        store_before = histogram(text, "gateway_store_duration_seconds")
         statuses: Counter[str] = Counter()
         providers: Counter[str] = Counter()
         latencies: list[float] = []
@@ -87,36 +115,41 @@ async def main() -> None:
                 "max_tokens": 64,
                 "messages": [{"role": "user", "content": f"load test request {i}"}],
             }
+            if args.rate:
+                await asyncio.sleep(max(0.0, t_start + i / args.rate - time.perf_counter()))
             async with sem:
                 t0 = time.perf_counter()
                 try:
-                    r = await client.post("/v1/chat/completions", json=body, headers={"X-API-Key": key})
-                    statuses[str(r.status_code)] += 1
-                    if r.status_code == 200:
-                        providers[r.headers.get("X-Gateway-Provider", "?")] += 1
-                        latencies.append(time.perf_counter() - t0)
-                except httpx.HTTPError as exc:
+                    async with client.post("/v1/chat/completions", json=body, headers={"X-API-Key": key}) as r:
+                        await r.read()
+                        statuses[str(r.status)] += 1
+                        if r.status == 200:
+                            providers[r.headers.get("X-Gateway-Provider", "?")] += 1
+                            latencies.append(time.perf_counter() - t0)
+                except (aiohttp.ClientError, TimeoutError) as exc:
                     statuses[type(exc).__name__] += 1
             done += 1
             if args.outage and done == args.requests // 2:
-                await client.post(
-                    "/v1/admin/providers/mock-primary/simulate-outage",
-                    params={"enabled": "true"},
-                    headers={"X-Admin-Key": args.admin_key},
-                )
+                await set_outage(True)
 
-        t0 = time.perf_counter()
+        t0 = t_start = time.perf_counter()
         await asyncio.gather(*(one(i) for i in range(args.requests)))
         wall = time.perf_counter() - t0
         if args.outage:
-            await client.post(
-                "/v1/admin/providers/mock-primary/simulate-outage",
-                params={"enabled": "false"},
-                headers={"X-Admin-Key": args.admin_key},
-            )
-        after = histogram((await client.get("/metrics")).text, "gateway_overhead_seconds")
+            await set_outage(False)
+        text = await metrics_text()
+        after = histogram(text, "gateway_overhead_seconds")
+        store_after = histogram(text, "gateway_store_duration_seconds")
 
     over = diff(after, before)
+    store = diff(store_after, store_before)
+
+    def hist_ms(buckets):
+        return {
+            f"p{int(q * 100)}": (round(v * 1000, 2) if (v := quantile(buckets, q)) is not None else None)
+            for q in (0.5, 0.95, 0.99)
+        }
+
     latencies.sort()
 
     def pct(q):
@@ -125,6 +158,7 @@ async def main() -> None:
     report = {
         "requests": args.requests,
         "concurrency": args.concurrency,
+        "mode": f"open loop @ {args.rate:g} req/s" if args.rate else "closed loop",
         "wall_seconds": round(wall, 2),
         "throughput_rps": round(args.requests / wall, 1),
         "status_counts": dict(statuses),
@@ -135,12 +169,15 @@ async def main() -> None:
             "p99": pct(0.99),
             "mean": round(statistics.fmean(latencies) * 1000, 1) if latencies else None,
         },
-        "gateway_overhead_ms": {
-            f"p{int(q * 100)}": (round(v * 1000, 2) if (v := quantile(over, q)) is not None else None)
-            for q in (0.5, 0.95, 0.99)
-        },
+        "gateway_overhead_ms": hist_ms(over),
+        # Part of the overhead: state-store calls on the request path (Redis round trips in compose).
+        "store_call_ms": hist_ms(store),
     }
     print(json.dumps(report, indent=2))
+    for q, limit in (("p95", args.max_overhead_p95_ms), ("p99", args.max_overhead_p99_ms)):
+        value = report["gateway_overhead_ms"][q]
+        if limit is not None and (value is None or value > limit):
+            raise SystemExit(f"gateway overhead {q} {value} ms exceeds {limit} ms")
 
 
 if __name__ == "__main__":

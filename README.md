@@ -187,7 +187,7 @@ Alert rules (`deploy/prometheus/alerts.yml`) route to Slack through Alertmanager
 - a tier with no healthy provider
 - a team at 80% or 100% of its budget
 - P99 latency above the 5 s SLA
-- gateway P99 overhead above 10 ms
+- gateway P99 overhead above 10 ms (sustained for 10 minutes)
 
 ## Verification
 
@@ -206,35 +206,59 @@ The test suite covers:
 - streaming output that matches non-streaming output, plus failover before the first byte;
 - enrichment, admin RBAC and auditing, and policy hot reload.
 
-CI runs the suite on Python 3.11–3.13 against a real Redis instance; the Redis tests fail rather than skip if Redis is missing. CI also validates the Prometheus and Alertmanager configs, boots the compose stack, smoke-tests failover against real HTTP faults injected into the mock provider, and runs a 5,000-request load test.
+CI runs the suite on Python 3.11–3.13 against a real Redis instance; the Redis tests fail rather than skip if Redis is missing. CI also validates the Prometheus and Alertmanager configs, boots the compose stack, smoke-tests failover against real HTTP faults injected into the mock provider, and runs two load tests: a 5,000-request capacity run, and an open-loop run at 100 req/s that fails CI if overhead p95 exceeds 25 ms. That 25 ms limit is a regression guard sized for noisy shared runners.
 
 ## Load test
 
 ```bash
-python loadtests/loadtest.py --requests 5000 --concurrency 500 [--outage]   # mixed teams, tiers, priorities
+python loadtests/loadtest.py --requests 5000 --concurrency 500 [--outage]   # capacity: closed loop, mixed teams/tiers/priorities
+python loadtests/loadtest.py --requests 3000 --rate 100                     # overhead SLO: fixed arrival rate (open loop)
 k6 run loadtests/gateway.js                                                   # sustained arrival-rate profile
 ```
 
-`loadtest.py` reads gateway overhead from the gateway's own `gateway_overhead_seconds` histogram, so the figure does not include provider latency.
+`loadtest.py` reads two of the gateway's own histograms:
 
-**Measured, local:** Windows 11 laptop, gateway plus two mock providers as separate single-process uvicorn servers, in-memory store, 5,000 requests at 500 concurrency.
+- `gateway_overhead_seconds`: time in the gateway, excluding provider calls and retry backoff.
+- `gateway_store_duration_seconds`: request-path Redis calls. This is a subset of overhead.
 
-| Run | Gateway overhead p50 / p95 / p99 | Outcome |
+Neither figure includes provider latency.
+
+The two modes measure different things:
+
+- **Closed loop** keeps 500 requests in flight. That is more than the gateway can serve at once, so requests queue for CPU and the queueing time appears as "overhead". Use this mode for **capacity**, not for overhead.
+- **Open loop** (`--rate`) sends a fixed request rate below capacity. That is the condition the <10 ms overhead target is about.
+
+**CI.** Every PR runs the `compose-smoke` job on a GitHub-hosted runner. The full compose stack (Redis, both mocks, Jaeger) and the load generator share one small VM. The latest run on this branch:
+
+| Mode | Throughput | Overhead p50 / p95 / p99 | Store calls p50 / p95 / p99 | Outcome |
+| --- | --- | --- | --- | --- |
+| Capacity: closed loop, 500 in flight, 5,000 requests | **463 req/s** | 73 / 182 / 237 ms (queueing) | 35 / 83 / 159 ms | 4,413 × 200, 587 × 429, zero errors |
+| SLO: open loop at 100 req/s, 3,000 requests | 100 req/s | **1.7 / 3.9 / 7.7 ms** | 0.27 / 0.86 / 3.3 ms | 2,615 × 200, 385 × 429, zero errors |
+
+On identical code, overhead p95 at 100 req/s ranged from **3.9 to 12.1 ms** across runs, and capacity from 296 to 463 req/s. That spread depends on which runner the job lands on: in the slowest run, Redis calls alone had p95 4.3 ms, against 0.86 ms in the fastest. CI therefore uses this run as a **regression guard**, failing if p95 exceeds 25 ms, and does not treat it as proof of the 10 ms target.
+
+p99 is reported but not gated, because it is noisy on shared runners: 7.7, 21.4 and 21.8 ms across the last three runs on identical code. Redis calls at p99 (3.3 ms) do not account for the tail; it is CPU scheduling on a 2-vCPU VM that also runs Redis, both mocks, Jaeger and the load generator.
+
+**The <10 ms target is met at p50 in every CI run, at p95 and p99 in some runs, and at every percentile locally.** It has not been verified on dedicated hardware with Redis. That measurement is the remaining step before quoting it as an SLO. All values are interpolated within histogram buckets.
+
+**Local.** Windows 11 laptop with the in-memory store, so there are no Redis round trips:
+
+| Mode | Throughput | Overhead p50 / p95 / p99 |
 | --- | --- | --- |
-| steady | 0.56 / 0.97 / 1.72 ms | 4,503 × 200, 497 × 429 (the `search` team's 30 req/min limit) |
-| primary outage at the halfway point | 0.91 / 2.36 / 3.19 ms | 4,404 × 200 (2,475 served by the fallback), 596 × 429, zero 5xx |
+| Capacity, 300 in flight | 570 req/s | 0.28 / 0.80 / 0.98 ms |
+| Open loop at 200 req/s | 200 req/s | 0.72 / 1.73 / 2.35 ms |
+| Capacity, 500 in flight, primary outage halfway through | 388 req/s | 0.72 / 2.13 / 2.49 ms; 2,287 requests served by the fallback, zero 5xx |
 
-Throughput on that machine (about 80 req/s) was limited by the single-process Python mock server, not the gateway: calling the mock directly reached about 100 req/s.
+**How throughput went from 83 to 463 req/s in CI:**
 
-**Measured, CI:** the `compose-smoke` job on a GitHub-hosted Linux runner, with the full compose stack (Redis-backed) and the load generator sharing the same small VM. 5,000 requests at 500 concurrency.
+1. **httpx was the bottleneck.** Against the same mock provider, httpx fell from 204 to 89 req/s as concurrency rose from 10 to 200, while aiohttp reached 3,346 req/s. The gateway now calls providers through aiohttp (`app/http.py`).
+2. **Admission is one Redis round trip.** Rate limiting and budget reservation run in a single Lua script.
+3. **Lighter middleware.** A pure ASGI middleware replaced Starlette's `BaseHTTPMiddleware`.
+4. **Trace sampling.** Head-based sampling uses `GATEWAY_OTEL_SAMPLE_RATIO`, set to 0.1 in compose. Span export holds the GIL in a background thread.
 
-| Run | Gateway overhead p50 / p95 / p99 | Outcome |
-| --- | --- | --- |
-| steady | 4.85 / 65.9 / ≥100 ms (the top histogram bucket) | 4,541 × 200, 458 × 429, 1 client-side connection reset; 83 req/s |
+`gc.freeze()` also runs after startup.
 
-This run does **not** meet the <10 ms p99 target. Everything competed for the runner's CPU: the gateway, Redis, both mocks and 500 client coroutines. Overhead here is mostly event-loop queueing, not gateway logic, and this is exactly the situation the `GatewayOverheadHigh` alert reports.
-
-Next step: measure on dedicated hardware with several gateway workers (`uvicorn --workers N` or more replicas) and multi-process mocks, then publish that number.
+To scale further, run more gateway replicas: Redis already holds all shared limit and budget state.
 
 ## Production notes and backlog
 

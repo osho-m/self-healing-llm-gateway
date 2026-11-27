@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     log_json: bool = True
     otel_exporter_otlp_endpoint: str | None = None
     otel_service_name: str = "llm-gateway"
+    otel_sample_ratio: float = Field(default=1.0, ge=0.0, le=1.0)
 
     audit_log_path: str | None = "data/audit.log"
     health_checks_enabled: bool = True
