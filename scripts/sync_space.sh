@@ -39,5 +39,5 @@ git branch -f space-sync "$commit"
 echo "Prepared space-sync at $(git rev-parse --short "$commit") on top of $(git rev-parse --short refs/remotes/space/main)."
 
 if [ "${1:-}" = "--push" ]; then
-  git push "$SPACE_URL" space-sync:main
+  git push "$SPACE_URL" "$commit:refs/heads/main"
 fi
