@@ -18,9 +18,22 @@ RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504, 529}
 class ProviderError(Exception):
     """Normalized provider failure. ``retryable`` drives retry/fallback decisions."""
 
-    def __init__(self, provider: str, kind: str, message: str, *, retryable: bool, status: int | None = None) -> None:
+    def __init__(
+        self,
+        provider: str,
+        kind: str,
+        message: str,
+        *,
+        retryable: bool,
+        status: int | None = None,
+        usage: tuple[int, int] | None = None,
+    ) -> None:
         super().__init__(f"{provider}: {kind}: {message}")
         self.provider, self.kind, self.retryable, self.status = provider, kind, retryable, status
+        # (prompt_tokens, completion_tokens) the provider billed for a failed call, e.g. a refusal.
+        self.usage = usage
+        # Cost of ``usage`` at the prices of the adapter that made the call; set by the gateway.
+        self.billed_usd = 0.0
 
 
 def error_from_status(provider: str, status: int, body: str) -> ProviderError:
@@ -85,12 +98,33 @@ class Provider(ABC):
         self.config = config
         self.name = config.name
         self.client = client
+        self._inflight = 0
+        self._retired = False
+
+    def acquire(self) -> None:
+        """Mark one call in flight. Pair with :meth:`release`."""
+        self._inflight += 1
+
+    async def release(self) -> None:
+        self._inflight -= 1
+        if self._retired and self._inflight == 0:
+            await self.aclose()
+
+    async def retire(self) -> None:
+        """Called when a policy reload replaces or removes this adapter: close once idle."""
+        self._retired = True
+        if self._inflight == 0:
+            await self.aclose()
 
     @abstractmethod
     async def complete(self, request: CompletionRequest) -> CompletionResult: ...
 
     @abstractmethod
     def stream(self, request: CompletionRequest) -> AsyncIterator[StreamChunk]: ...
+
+    async def aclose(self) -> None:
+        """Release provider-owned resources (SDK clients). Shared HTTP clients are closed by the gateway."""
+        return None
 
     async def probe(self) -> None:
         """Cheap liveness probe used by the health monitor."""

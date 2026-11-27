@@ -107,6 +107,14 @@ def create_app(
             else MemoryStore()
         )
     gateway = Gateway(policy, store, Metrics(), AuditLog(settings.audit_log_path), client=client, sleep=sleep)
+    if production:
+        unserved = [
+            tier
+            for tier, chain in policy.policy.tiers.items()
+            if not any(policy.policy.provider(p).is_configured() for p in chain)
+        ]
+        if unserved:
+            raise ValueError(f"no configured provider (API key set) for tiers {unserved}")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

@@ -9,7 +9,7 @@ import random
 import time
 import uuid
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from app.audit import AuditLog
@@ -24,6 +24,7 @@ from app.schemas import ChatMessage, ChatRequest, ChatResponse, Choice, GatewayM
 from app.stores import Store, seconds_until_utc_midnight
 
 log = logging.getLogger(__name__)
+_BACKGROUND_TASKS: set[asyncio.Task] = set()  # strong refs so close tasks are not GC'd mid-flight
 
 
 @dataclass
@@ -35,6 +36,11 @@ class Admission:
     reserved_usd: float
     started: float
     rate_headers: dict[str, str]
+    # max_tokens each provider in the chain was admitted with (its min_max_tokens floor applied at
+    # admission time). Calls use these, so a later policy reload cannot exceed the reservation.
+    output_caps: dict[str, int] = field(default_factory=dict)
+    # Cost a provider billed for a call that failed without retry (e.g. a refusal); settled instead of 0.
+    failed_cost_usd: float = 0.0
     provider_time: float = 0.0
     attempts: list[str] = field(default_factory=list)
 
@@ -72,7 +78,16 @@ class Gateway:
             return
         res = self.policy.resilience
         for cfg in self.policy.providers:
-            self.providers[cfg.name] = build_provider(cfg, self.client)
+            old = self.providers.get(cfg.name)
+            if old is None or old.config != cfg:
+                self.providers[cfg.name] = build_provider(cfg, self.client)
+                if old is not None:
+                    self._close_later(old)
+            if not cfg.is_configured():
+                log.warning(
+                    "provider not configured; it will be skipped",
+                    extra={"provider": cfg.name, "missing_env": cfg.api_key_env},
+                )
             if cfg.name in self.breakers:
                 self.breakers[cfg.name].configure(
                     res.circuit_failure_threshold, res.circuit_window_s, res.circuit_cooldown_s
@@ -90,8 +105,21 @@ class Gateway:
             tracker.window_s = res.health_window_s
             self._set_health_gauge(cfg.name, tracker.status)
         for gone in set(self.providers) - {p.name for p in self.policy.providers}:
-            self.providers.pop(gone, None)
+            self._close_later(self.providers.pop(gone))
         self._policy_version = self.policy_manager.version
+
+    @staticmethod
+    def _close_later(provider: Provider) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # no running loop (startup or tests); nothing to schedule on
+            return
+        task = loop.create_task(provider.retire())
+        _BACKGROUND_TASKS.add(task)
+        task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+    def _configured(self, name: str) -> bool:
+        return self.policy.provider(name).is_configured()
 
     async def refresh_policy(self) -> None:
         self.policy_manager.reload_if_changed()
@@ -132,8 +160,17 @@ class Gateway:
             messages.insert(0, {"role": "system", "content": cfg.system_prompt})
         return messages
 
+    def _chain_configs(self, tier: str) -> list:
+        """Providers that can actually serve this tier (falls back to all if none are configured)."""
+        chain = [self.policy.provider(p) for p in self.policy.tiers[tier]]
+        return [c for c in chain if c.is_configured()] or chain
+
     def _max_cost(self, tier: str, prompt_tokens: int, max_tokens: int) -> float:
-        return max(self.policy.provider(p).cost_usd(prompt_tokens, max_tokens) for p in self.policy.tiers[tier])
+        # Each provider may raise max_tokens to its floor (min_max_tokens); reserve for that.
+        return max(c.cost_usd(prompt_tokens, max(max_tokens, c.min_max_tokens)) for c in self._chain_configs(tier))
+
+    def _output_caps(self, tier: str, max_tokens: int) -> dict[str, int]:
+        return {c.name: max(max_tokens, c.min_max_tokens) for c in self._chain_configs(tier)}
 
     async def admit(self, team: TeamPolicy, req: ChatRequest) -> Admission:
         started = time.perf_counter()
@@ -144,7 +181,8 @@ class Gateway:
             raise GatewayError(403, "tier_not_allowed", f"Team {team.team_id!r} may not use tier {req.model!r}.")
         messages = self._enrich(team, req)
         prompt_est = sum(estimate_tokens(m["content"]) for m in messages)
-        token_need = prompt_est + req.max_tokens
+        output_caps = self._output_caps(req.model, req.max_tokens)
+        token_need = prompt_est + max(output_caps.values())
 
         estimate = self._max_cost(req.model, prompt_est, req.max_tokens)
         with tracer.start_as_current_span("gateway.admission") as span, self.metrics.store_duration.time():
@@ -184,17 +222,37 @@ class Gateway:
             "X-RateLimit-Remaining-Tokens": str(int(decision.remaining_tokens)),
         }
         creq = CompletionRequest(messages=messages, max_tokens=req.max_tokens, temperature=req.temperature)
-        return Admission(rid, team, req, creq, estimate, started, rate_headers)
+        return Admission(rid, team, req, creq, estimate, started, rate_headers, output_caps)
 
     # ------------------------------------------------------------------ provider invocation
 
-    async def _invoke(self, name: str, creq: CompletionRequest) -> CompletionResult:
+    def _sized(self, name: str, creq: CompletionRequest, caps: dict[str, int] | None) -> CompletionRequest:
+        """Size max_tokens for one provider.
+
+        Admitted requests use the cap admission reserved for that provider (routing skips providers
+        that were not part of the admission snapshot). Calls outside admission (health probes) apply
+        the provider's current floor.
+        """
+        if caps is not None:
+            return replace(creq, max_tokens=caps[name])
+        tokens = max(creq.max_tokens, self.policy.provider(name).min_max_tokens)
+        return creq if tokens == creq.max_tokens else replace(creq, max_tokens=tokens)
+
+    async def _invoke(self, name: str, creq: CompletionRequest, caps: dict[str, int] | None = None) -> CompletionResult:
         fault = self.faults.get(name)
         if fault.latency_ms:
             await asyncio.sleep(fault.latency_ms / 1000)
         if fault.outage:
             raise ProviderError(name, "server_error", "simulated outage", retryable=True, status=503)
-        return await self.providers[name].complete(creq)
+        adapter = self.providers[name]
+        adapter.acquire()
+        try:
+            return await adapter.complete(self._sized(name, creq, caps))
+        except ProviderError as err:
+            self._price_usage(adapter, err)
+            raise
+        finally:
+            await adapter.release()
 
     def _backoff(self, attempt: int) -> float:
         res = self.policy.resilience
@@ -204,6 +262,13 @@ class Gateway:
         self.health[name].record(ok, seconds * 1000, None if err is None else f"{err.kind}: {err}")
         self.metrics.provider_latency.labels(name).observe(seconds)
         self._evaluate_health(name)
+
+    @staticmethod
+    def _price_usage(adapter: Provider, err: ProviderError) -> None:
+        # Price billed usage with the invoked adapter's own config: a reload during the call may
+        # have removed the provider or changed its prices.
+        if err.usage:
+            err.billed_usd = adapter.config.cost_usd(*err.usage)
 
     def _non_retryable(self, err: ProviderError) -> GatewayError:
         if err.kind == "content_policy":
@@ -216,6 +281,13 @@ class Gateway:
         res, tier = self.policy.resilience, adm.req.model
         chain = self.policy.tiers[tier]
         for idx, name in enumerate(chain):
+            if not self._configured(name):
+                adm.attempts.append(f"{name}: not configured")
+                continue
+            if name not in adm.output_caps:
+                # Became available in a reload after admission: no budget was reserved for it.
+                adm.attempts.append(f"{name}: not admitted")
+                continue
             breaker = self.breakers[name]
             if not breaker.allow():
                 adm.attempts.append(f"{name}: circuit {breaker.state}")
@@ -225,7 +297,7 @@ class Gateway:
                     span.set_attributes({"gateway.provider": name, "gateway.attempt": attempt})
                     t0 = time.perf_counter()
                     try:
-                        result = await self._invoke(name, adm.creq)
+                        result = await self._invoke(name, adm.creq, adm.output_caps)
                     except ProviderError as err:
                         elapsed = time.perf_counter() - t0
                         adm.provider_time += elapsed
@@ -235,6 +307,7 @@ class Gateway:
                         adm.attempts.append(f"{name}: {err.kind}")
                         if not err.retryable:
                             breaker.release()
+                            adm.failed_cost_usd = err.billed_usd
                             raise self._non_retryable(err) from err
                         breaker.record_failure()
                         if breaker.state != CLOSED or attempt == res.max_retries:
@@ -267,7 +340,7 @@ class Gateway:
             try:
                 provider, result = await self.route(adm)
             except GatewayError as exc:
-                await self.store.settle_budget(team.team_id, adm.reserved_usd, 0.0)
+                await self.store.settle_budget(team.team_id, adm.reserved_usd, adm.failed_cost_usd)
                 self.metrics.requests.labels(team.team_id, tier, "none", str(exc.status_code), adm.req.priority).inc()
                 raise
             content = result.content
@@ -353,26 +426,43 @@ class Gateway:
     # ------------------------------------------------------------------ streaming
 
     async def _open_stream(
-        self, name: str, creq: CompletionRequest
-    ) -> tuple[list[StreamChunk], AsyncIterator[StreamChunk]]:
+        self, name: str, creq: CompletionRequest, caps: dict[str, int] | None = None
+    ) -> tuple[list[StreamChunk], AsyncIterator[StreamChunk], Provider]:
         """Start a provider stream and buffer until the first content delta, so failover stays invisible."""
         fault = self.faults.get(name)
         if fault.latency_ms:
             await asyncio.sleep(fault.latency_ms / 1000)
         if fault.outage:
             raise ProviderError(name, "server_error", "simulated outage", retryable=True, status=503)
-        agen = self.providers[name].stream(creq).__aiter__()
-        buffered: list[StreamChunk] = []
-        async for chunk in agen:
-            buffered.append(chunk)
-            if chunk.delta or chunk.finish_reason:
-                break
-        return buffered, agen
+        adapter = self.providers[name]
+        adapter.acquire()  # released by _sse when the stream ends, or below if opening fails
+        try:
+            agen = adapter.stream(self._sized(name, creq, caps)).__aiter__()
+            buffered: list[StreamChunk] = []
+            async for chunk in agen:
+                buffered.append(chunk)
+                if chunk.delta or chunk.finish_reason:
+                    break
+        except ProviderError as err:
+            self._price_usage(adapter, err)
+            await adapter.release()
+            raise
+        except BaseException:
+            await adapter.release()
+            raise
+        return buffered, agen, adapter
 
     async def stream(self, adm: Admission) -> tuple[str, AsyncIterator[bytes]]:
         res, tier = self.policy.resilience, adm.req.model
         chain = self.policy.tiers[tier]
         for idx, name in enumerate(chain):
+            if not self._configured(name):
+                adm.attempts.append(f"{name}: not configured")
+                continue
+            if name not in adm.output_caps:
+                # Became available in a reload after admission: no budget was reserved for it.
+                adm.attempts.append(f"{name}: not admitted")
+                continue
             breaker = self.breakers[name]
             if not breaker.allow():
                 adm.attempts.append(f"{name}: circuit {breaker.state}")
@@ -380,7 +470,7 @@ class Gateway:
             for attempt in range(res.max_retries + 1):
                 t0 = time.perf_counter()
                 try:
-                    buffered, agen = await self._open_stream(name, adm.creq)
+                    buffered, agen, adapter = await self._open_stream(name, adm.creq, adm.output_caps)
                 except ProviderError as err:
                     elapsed = time.perf_counter() - t0
                     adm.provider_time += elapsed
@@ -389,7 +479,7 @@ class Gateway:
                     adm.attempts.append(f"{name}: {err.kind}")
                     if not err.retryable:
                         breaker.release()
-                        await self.store.settle_budget(adm.team.team_id, adm.reserved_usd, 0.0)
+                        await self.store.settle_budget(adm.team.team_id, adm.reserved_usd, err.billed_usd)
                         raise self._non_retryable(err) from err
                     breaker.record_failure()
                     if breaker.state != CLOSED or attempt == res.max_retries:
@@ -402,7 +492,7 @@ class Gateway:
                 adm.provider_time += time.perf_counter() - t0
                 if idx > 0:
                     self.metrics.fallbacks.labels(tier, chain[0], name).inc()
-                return name, self._sse(adm, name, buffered, agen, t0)
+                return name, self._sse(adm, name, buffered, agen, t0, adapter)
         await self.store.settle_budget(adm.team.team_id, adm.reserved_usd, 0.0)
         self.metrics.requests.labels(adm.team.team_id, tier, "none", "503", adm.req.priority).inc()
         raise GatewayError(
@@ -413,7 +503,13 @@ class Gateway:
         )
 
     async def _sse(
-        self, adm: Admission, provider: str, buffered: list[StreamChunk], agen: AsyncIterator[StreamChunk], t0: float
+        self,
+        adm: Admission,
+        provider: str,
+        buffered: list[StreamChunk],
+        agen: AsyncIterator[StreamChunk],
+        t0: float,
+        adapter: Provider,
     ) -> AsyncIterator[bytes]:
         tier, team = adm.req.model, adm.team
         rid = f"chatcmpl-{adm.request_id}"
@@ -484,7 +580,14 @@ class Gateway:
             yield b"data: [DONE]\n\n"
             self._observe(adm, provider, time.perf_counter() - adm.started)
         except ProviderError as err:
-            breaker.record_failure()
+            if err.usage:  # the provider reported what it billed (e.g. a refusal): charge exactly that
+                self._price_usage(adapter, err)
+                await self.store.settle_budget(team.team_id, adm.reserved_usd, err.billed_usd)
+                settled = True
+            if err.retryable:
+                breaker.record_failure()
+            else:  # e.g. a refusal: the provider is healthy, so it must not trip the shared breaker
+                breaker.release()
             self._record(provider, False, time.perf_counter() - t0, err)
             self.metrics.errors.labels(team.team_id, tier, provider, f"stream_{err.kind}").inc()
             self.metrics.requests.labels(team.team_id, tier, provider, "502", adm.req.priority).inc()
@@ -493,6 +596,7 @@ class Gateway:
             }
             yield f"data: {json.dumps(err_body)}\n\n".encode()
         finally:
+            await adapter.release()
             self.metrics.inflight.dec()
             if not settled:
                 # Charge what was delivered (estimate) so aborted streams are not free.
@@ -504,9 +608,12 @@ class Gateway:
     # ------------------------------------------------------------------ health checks
 
     async def probe_all(self) -> None:
-        await asyncio.gather(*(self.probe(name) for name in list(self.providers)), return_exceptions=True)
+        names = [n for n, p in self.providers.items() if p.config.probe and p.config.is_configured()]
+        await asyncio.gather(*(self.probe(name) for name in names), return_exceptions=True)
 
     async def probe(self, name: str) -> None:
+        if not self._configured(name):
+            return
         breaker = self.breakers[name]
         half_open = breaker.current_state() == HALF_OPEN
         if half_open and not breaker.allow():
@@ -541,7 +648,8 @@ class Gateway:
             out[name] = {
                 "kind": cfg.kind,
                 "model": cfg.model,
-                "status": status,
+                "configured": cfg.is_configured(),
+                "status": status if cfg.is_configured() else "not_configured",
                 "circuit": self.breakers[name].current_state(),
                 **tracker.stats(),
                 "last_error": tracker.last_error,
@@ -553,5 +661,6 @@ class Gateway:
         return out
 
     async def aclose(self) -> None:
+        await asyncio.gather(*(p.aclose() for p in self.providers.values()), return_exceptions=True)
         await self.client.aclose()
         await self.store.close()
