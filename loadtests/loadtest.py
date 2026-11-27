@@ -17,7 +17,7 @@ import statistics
 import time
 from collections import Counter
 
-import httpx
+import aiohttp
 
 PROFILES = [
     # (weight, key, tier, priority)
@@ -69,9 +69,23 @@ async def main() -> None:
     ap.add_argument("--admin-key", default="demo-admin-key-change-me-0000")
     args = ap.parse_args()
 
-    limits = httpx.Limits(max_connections=args.concurrency, max_keepalive_connections=args.concurrency)
-    async with httpx.AsyncClient(base_url=args.url, timeout=60, limits=limits) as client:
-        before = histogram((await client.get("/metrics")).text, "gateway_overhead_seconds")
+    connector = aiohttp.TCPConnector(limit=args.concurrency)
+    timeout = aiohttp.ClientTimeout(total=120)
+    async with aiohttp.ClientSession(base_url=args.url, connector=connector, timeout=timeout) as client:
+
+        async def metrics_text() -> str:
+            async with client.get("/metrics") as r:
+                return await r.text()
+
+        async def set_outage(enabled: bool) -> None:
+            async with client.post(
+                "/v1/admin/providers/mock-primary/simulate-outage",
+                params={"enabled": str(enabled).lower()},
+                headers={"X-Admin-Key": args.admin_key},
+            ) as r:
+                r.raise_for_status()
+
+        before = histogram(await metrics_text(), "gateway_overhead_seconds")
         statuses: Counter[str] = Counter()
         providers: Counter[str] = Counter()
         latencies: list[float] = []
@@ -90,31 +104,24 @@ async def main() -> None:
             async with sem:
                 t0 = time.perf_counter()
                 try:
-                    r = await client.post("/v1/chat/completions", json=body, headers={"X-API-Key": key})
-                    statuses[str(r.status_code)] += 1
-                    if r.status_code == 200:
-                        providers[r.headers.get("X-Gateway-Provider", "?")] += 1
-                        latencies.append(time.perf_counter() - t0)
-                except httpx.HTTPError as exc:
+                    async with client.post("/v1/chat/completions", json=body, headers={"X-API-Key": key}) as r:
+                        await r.read()
+                        statuses[str(r.status)] += 1
+                        if r.status == 200:
+                            providers[r.headers.get("X-Gateway-Provider", "?")] += 1
+                            latencies.append(time.perf_counter() - t0)
+                except (aiohttp.ClientError, TimeoutError) as exc:
                     statuses[type(exc).__name__] += 1
             done += 1
             if args.outage and done == args.requests // 2:
-                await client.post(
-                    "/v1/admin/providers/mock-primary/simulate-outage",
-                    params={"enabled": "true"},
-                    headers={"X-Admin-Key": args.admin_key},
-                )
+                await set_outage(True)
 
         t0 = time.perf_counter()
         await asyncio.gather(*(one(i) for i in range(args.requests)))
         wall = time.perf_counter() - t0
         if args.outage:
-            await client.post(
-                "/v1/admin/providers/mock-primary/simulate-outage",
-                params={"enabled": "false"},
-                headers={"X-Admin-Key": args.admin_key},
-            )
-        after = histogram((await client.get("/metrics")).text, "gateway_overhead_seconds")
+            await set_outage(False)
+        after = histogram(await metrics_text(), "gateway_overhead_seconds")
 
     over = diff(after, before)
     latencies.sort()
