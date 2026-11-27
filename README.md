@@ -9,7 +9,7 @@ A gateway that sits between your apps and your AI models. It keeps each team wit
 
 **[Try the live demo](https://huggingface.co/spaces/oshom/self-healing-llm-gateway)**
 
-![A request goes through the gateway and a model answers](docs/images/space-normal.png)
+![Live demo: Qwen answers; then Qwen is switched off and the gateway fails over to Phi-3.5-mini](docs/images/failover-demo.gif)
 
 ## What it does
 
