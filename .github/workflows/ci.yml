@@ -27,9 +27,6 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      statuses: write
     strategy:
       fail-fast: false
       matrix:
@@ -48,20 +45,7 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "${{ matrix.python }}", cache: pip }
       - run: pip install -e '.[dev]'
-      - name: pytest
-        run: |
-          set -o pipefail
-          pytest -q -rfE --cov=app --cov-report=term-missing --cov-fail-under=85 2>&1 | tee pytest.log
-      - name: Surface failures as commit statuses (readable without log access)
-        if: failure() && github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          grep -E '^(FAILED|ERROR) |Required test coverage|^E  ' pytest.log | head -n 6 | nl -w1 -s' ' |
-          while read -r n line; do
-            gh api "repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }}" \
-              -f state=failure -f context="pytest-${{ matrix.python }}/$n" -f description="${line:0:139}" > /dev/null
-          done
+      - run: pytest -q -rfE --cov=app --cov-report=term-missing --cov-fail-under=85
 
   observability-config:
     runs-on: ubuntu-latest
