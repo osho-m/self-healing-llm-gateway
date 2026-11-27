@@ -3,6 +3,7 @@ import re
 import time
 
 import httpx
+import pytest
 
 from tests.conftest import BASE_POLICY, admin, chat, policy_dict
 
@@ -306,3 +307,43 @@ def test_request_id_echo_and_internal_error_shape(client):
     r = chat(client)
     assert r.status_code == 500 and r.json()["error"]["code"] == "internal_error"
     assert r.headers["X-Request-ID"]
+
+
+def test_unconfigured_provider_is_skipped_visibly(make_client, monkeypatch):
+    monkeypatch.delenv("UNSET_CLAUDE_KEY", raising=False)
+    data = policy_dict()
+    data["providers"].insert(
+        0, {"name": "claude", "kind": "anthropic", "model": "claude-opus-5-5", "api_key_env": "UNSET_CLAUDE_KEY"}
+    )
+    data["tiers"]["balanced"] = ["claude", "primary", "secondary"]
+    data["tiers"]["solo"] = ["claude"]
+    client = make_client(data)
+    meta = chat(client).json()["x_gateway"]
+    assert meta["provider"] == "primary" and meta["attempts"] == ["claude: not configured"]
+    report = admin(client, "GET", "/v1/admin/providers").json()["claude"]
+    assert report["configured"] is False and report["status"] == "not_configured"
+    r = chat(client, tier="solo")
+    assert r.status_code == 503  # a tier with only unconfigured providers cannot serve
+    assert client.get("/readyz").json()["tiers"]["solo"] is False
+
+
+def test_production_refuses_tier_without_configured_provider(policy_file, monkeypatch):
+    from app.main import create_app
+    from app.policy import PolicyManager, hash_key
+    from app.settings import Settings
+
+    monkeypatch.delenv("UNSET_CLAUDE_KEY", raising=False)
+    data = policy_dict()
+    for team in data["teams"]:
+        team["api_key_sha256"] = [hash_key(k) for k in team.pop("api_keys")]
+    data["providers"].append({"name": "claude", "kind": "anthropic", "model": "m", "api_key_env": "UNSET_CLAUDE_KEY"})
+    data["tiers"]["solo"] = ["claude"]
+    settings = Settings(
+        environment="production",
+        admin_api_key="k" * 32,
+        redis_url="redis://x",
+        audit_log_path=None,
+        health_checks_enabled=False,
+    )
+    with pytest.raises(ValueError, match="no configured provider"):
+        create_app(settings, policy=PolicyManager(policy_file(data), forbid_plaintext_keys=True))
