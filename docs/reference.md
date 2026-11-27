@@ -85,11 +85,18 @@ pytest -q --cov=app            # set REDIS_URL to include the Redis tests
 
 Every pull request runs lint and type checks, the tests on Python 3.11 to 3.13 against a real Redis (Redis tests fail instead of skipping when Redis is missing), a check of the Prometheus and Alertmanager configs, a Docker test that boots the whole stack and causes real HTTP failures, and two load tests that fail the build if gateway overhead gets worse.
 
+## Sharing circuits between gateway copies
+
+When you run several copies of the gateway behind a load balancer, point every copy at the same Redis with `GATEWAY_REDIS_URL`, and turn on `share_circuit_state` in the policy's `resilience` section. The Docker Compose setup does both. Without Redis, each copy keeps its own in-memory store and nothing is shared.
+
+When one copy opens a model's circuit, it writes a key to Redis that expires when the cooldown ends. Every other copy checks Redis every `circuit_sync_interval_s` seconds (default 1) and opens the same circuit, so all copies stop calling the broken model together and test it again at about the same time. The check must run more often than the cooldown, so the policy is rejected if `circuit_sync_interval_s` is not shorter than `circuit_cooldown_s`.
+
+Only opens are shared. Each copy still counts its own failures, so a request never waits on Redis for this. After the cooldown each copy sends its own test request, so a fleet of N copies sends at most N. Leave the setting off when copies should stay independent, as in the Hugging Face demo, where each visitor's outage switch must affect only that visitor.
+
 ## Roadmap
 
 1. A long-term usage ledger for invoicing (Postgres or ClickHouse). Redis keeps 48 hours.
-2. Circuit state shared across replicas through Redis.
-3. Single sign-on for admins instead of a shared admin key, and audit logs shipped to storage that cannot be edited.
-4. Idempotency keys, and one deadline per request across all its retries.
-5. A target for time to first token when streaming.
-6. Real tokenizers for the admission estimate, instead of assuming about 4 characters per token.
+2. Single sign-on for admins instead of a shared admin key, and audit logs shipped to storage that cannot be edited.
+3. Idempotency keys, and one deadline per request across all its retries.
+4. A target for time to first token when streaming.
+5. Real tokenizers for the admission estimate, instead of assuming about 4 characters per token.

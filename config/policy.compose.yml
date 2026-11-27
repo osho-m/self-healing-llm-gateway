@@ -71,3 +71,5 @@ resilience:
   circuit_window_s: 30
   circuit_cooldown_s: 15
   health_check_interval_s: 30
+  # Replicas share circuit opens through Redis (see docs/reference.md).
+  share_circuit_state: true

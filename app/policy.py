@@ -98,11 +98,22 @@ class ResiliencePolicy(BaseModel):
     circuit_failure_threshold: int = Field(default=3, ge=1)
     circuit_window_s: float = Field(default=30.0, gt=0)
     circuit_cooldown_s: float = Field(default=15.0, gt=0)
+    # Share circuit opens between gateway replicas through the store (Redis): when one replica opens a
+    # provider's circuit, the others open it too within ``circuit_sync_interval_s``.
+    share_circuit_state: bool = False
+    circuit_sync_interval_s: float = Field(default=1.0, gt=0)
     health_check_interval_s: float = Field(default=30.0, gt=0)
     health_window_s: float = Field(default=300.0, gt=0)
     degraded_error_rate: float = Field(default=0.05, ge=0, le=1)
     down_error_rate: float = Field(default=0.5, ge=0, le=1)
     degraded_p99_ms: float = Field(default=5000.0, gt=0)
+
+    @model_validator(mode="after")
+    def _sync_faster_than_cooldown(self) -> ResiliencePolicy:
+        # A shared open lives for one cooldown; replicas that poll less often could miss it entirely.
+        if self.share_circuit_state and self.circuit_sync_interval_s >= self.circuit_cooldown_s:
+            raise ValueError("circuit_sync_interval_s must be shorter than circuit_cooldown_s when sharing circuits")
+        return self
 
 
 class Policy(BaseModel):

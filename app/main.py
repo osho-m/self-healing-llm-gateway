@@ -126,6 +126,10 @@ def create_app(
         if settings.health_checks_enabled:
             interval = gateway.policy.resilience.health_check_interval_s
             tasks.append(asyncio.create_task(_loop(interval, gateway.probe_all, "health")))
+        # Always running: sync_circuits checks the live setting, so turning sharing on in a policy
+        # reload takes effect without a restart.
+        interval = gateway.policy.resilience.circuit_sync_interval_s
+        tasks.append(asyncio.create_task(_loop(interval, gateway.sync_circuits, "circuits")))
         await gateway.refresh_policy()
         log.info("gateway started", extra={"environment": settings.environment, "store": type(store).__name__})
         try:
