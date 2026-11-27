@@ -115,3 +115,18 @@ def test_production_forbids_plaintext_api_keys(policy_file):
     os.utime(path, (os.path.getatime(path), os.path.getmtime(path) + 5))
     assert mgr.reload_if_changed() is False
     assert mgr.team_by_key("alpha-key").team_id == "alpha"
+
+
+def test_production_app_rejects_injected_policy_without_plaintext_guard(policy_file):
+    from app.main import create_app
+    from app.settings import Settings
+
+    settings = Settings(
+        environment="production",
+        admin_api_key="k" * 32,
+        redis_url="redis://x",
+        audit_log_path=None,
+        health_checks_enabled=False,
+    )
+    with pytest.raises(ValueError, match="forbid_plaintext_keys"):
+        create_app(settings, policy=PolicyManager(policy_file()))
