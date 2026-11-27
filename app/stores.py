@@ -232,10 +232,19 @@ return s
 class RedisStore(Store):
     OVERRIDES_KEY = "gw:policy:overrides"
 
-    def __init__(self, url: str, prefix: str = "gw") -> None:
+    def __init__(self, url: str, prefix: str = "gw", max_connections: int = 200, pool_timeout_s: float = 2.0) -> None:
         import redis.asyncio as redis
 
-        self.r = redis.from_url(url, decode_responses=True, socket_timeout=1.0, socket_connect_timeout=1.0)
+        # Blocking pool: bursts above max_connections wait for a free connection instead of failing.
+        pool = redis.BlockingConnectionPool.from_url(
+            url,
+            max_connections=max_connections,
+            timeout=pool_timeout_s,
+            decode_responses=True,
+            socket_timeout=1.0,
+            socket_connect_timeout=1.0,
+        )
+        self.r = redis.Redis(connection_pool=pool)
         self.p = prefix
         self._acquire = self.r.register_script(_ACQUIRE_LUA)
         self._reserve = self.r.register_script(_RESERVE_LUA)
@@ -297,4 +306,4 @@ class RedisStore(Store):
             return False
 
     async def close(self) -> None:
-        await self.r.aclose()
+        await self.r.aclose(close_connection_pool=True)
