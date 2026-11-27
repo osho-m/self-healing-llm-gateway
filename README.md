@@ -49,7 +49,7 @@ Measured, not estimated. Details and methodology are in [docs/benchmarks.md](doc
 | Throughput optimization | **83 → 463 req/s** on the same 2-vCPU runner, after finding and replacing an HTTP-client bottleneck |
 | Real provider outage (local Ollama process killed) | Connection errors opened the circuit and the fallback served the request; the circuit closed again after the provider returned ([details](docs/real-model-run.md)) |
 | Live demo with a real model | Qwen2.5-1.5B-Instruct on ZeroGPU served through the gateway (about 0.8 s warm, 2.9 s cold). Under a simulated outage the request failed over and was still answered; after the cooldown the model served again |
-| Test suite | 87 tests on Python 3.11–3.13 against real Redis, with ruff and mypy clean |
+| Test suite | 101 tests on Python 3.11–3.13 against real Redis, with ruff and mypy clean |
 
 ## Architecture
 
