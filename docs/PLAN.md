@@ -13,7 +13,7 @@ The specification is *Project 11: LLM Gateway with Rate Limiting, Fallback Routi
 
 | # | Spec requirement | Implementation | Verified by |
 | --- | --- | --- | --- |
-| 1.1 | Unified provider interface (OpenAI, Anthropic, Ollama) | `app/providers/*` | `tests/test_providers.py` |
+| 1.1 | Unified provider interface (Ollama, OpenAI-compatible servers such as vLLM, in-process models, Anthropic) | `app/providers/*` | `tests/test_providers.py` |
 | 1.2 | Team API keys, allowed models, routing | `app/api.py` `require_team`, `app/policy.py` | `test_api.py::test_tier_restrictions`, `test_requires_valid_key` |
 | 1.3 | Streaming passthrough with full-response logging | `Gateway.stream/_sse` | `test_streaming_*` |
 | 1.4 | Per-team enrichment (system prompt, disclaimer, filter) | `Gateway._enrich`, disclaimer in `complete/_sse` | `test_enrichment_*` |
@@ -52,3 +52,4 @@ The specification is *Project 11: LLM Gateway with Rate Limiting, Fallback Routi
 - **Gateway-side fault injection and mock-side faults.** The first gives demos deterministic outages. The second (`POST /fault` on the mock provider) exercises the real HTTP error path in CI.
 - **Breaker state stays per replica.** It is cheap and fast. If replicas must agree immediately, sharing it through Redis is listed in the backlog.
 - **The Space reuses the production engine.** `demo.py` imports `app.gateway`, so the demo cannot drift from the shipped code.
+- **Open-source models by default.** Every shipped setup runs SmolLM2, Qwen2.5 and Phi-3.5. Paid APIs are optional and switch on only when their key is set.
