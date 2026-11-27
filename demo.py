@@ -45,8 +45,12 @@ if spaces is not None:
 
     _loaded = {}
     for cfg in LOCAL:
-        tokenizer = AutoTokenizer.from_pretrained(cfg.model)
-        model = AutoModelForCausalLM.from_pretrained(cfg.model, dtype=torch.bfloat16).to("cuda")
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(cfg.model)
+            model = AutoModelForCausalLM.from_pretrained(cfg.model, dtype=torch.bfloat16).to("cuda")
+        except Exception:  # one model failing to load must not take the others down
+            log.exception("could not load %s; the gateway will skip it", cfg.model)
+            continue
         _loaded[cfg.model] = (tokenizer, model)
 
     @spaces.GPU(duration=30)
@@ -61,7 +65,7 @@ if spaces is not None:
         text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
         return LocalGeneration(text=text, prompt_tokens=int(prompt_len), completion_tokens=int(new_tokens.shape[-1]))
 
-    for cfg in LOCAL:
+    for cfg in [c for c in LOCAL if c.model in _loaded]:
         register_local_model(cfg.model, lambda messages, max_tokens, m=cfg.model: _run(m, messages, max_tokens))
 else:
     log.warning("no ZeroGPU runtime: the local models are skipped and the mock answers")
