@@ -5,8 +5,9 @@ colorFrom: blue
 colorTo: purple
 sdk: gradio
 app_file: demo.py
+python_version: "3.12"
 pinned: false
-short_description: Live LLM gateway demo with failover, circuit breakers, and budgets.
+short_description: No-key LLM gateway with automatic failover.
 tags:
   - llm
   - fastapi
@@ -96,6 +97,8 @@ Without `GATEWAY_REDIS_URL` the gateway uses in-process stores, which is fine fo
 ### Hugging Face Space (no Docker, no keys)
 
 `demo.py` runs **the same gateway engine** in-process with mock providers. Hugging Face installs `requirements.txt` and starts it automatically. In the UI you can send requests, toggle a `mock-primary` outage, watch traffic fail over, and run a health probe to see the circuit close.
+
+Live at [huggingface.co/spaces/oshom/self-healing-llm-gateway](https://huggingface.co/spaces/oshom/self-healing-llm-gateway). The Space runs on either CPU basic or ZeroGPU hardware. ZeroGPU will not start a Space unless it defines a `@spaces.GPU` function, so `demo.py` defines a no-op one whenever the `spaces` package is installed. The gateway itself never uses a GPU.
 
 ## API
 
