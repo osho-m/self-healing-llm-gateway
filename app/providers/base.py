@@ -32,6 +32,8 @@ class ProviderError(Exception):
         self.provider, self.kind, self.retryable, self.status = provider, kind, retryable, status
         # (prompt_tokens, completion_tokens) the provider billed for a failed call, e.g. a refusal.
         self.usage = usage
+        # Cost of ``usage`` at the prices of the adapter that made the call; set by the gateway.
+        self.billed_usd = 0.0
 
 
 def error_from_status(provider: str, status: int, body: str) -> ProviderError:

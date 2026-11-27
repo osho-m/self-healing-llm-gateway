@@ -84,6 +84,13 @@ class FakeAnthropic:
             await resp.prepare(request)
             await asyncio.sleep(30)
             return resp
+        if self.mode == "stream_refusal" and body.get("stream"):
+            refusal = {
+                "type": "message_delta",
+                "delta": {"stop_reason": "refusal", "stop_sequence": None},
+                "usage": {"input_tokens": 9, "output_tokens": 2},  # cumulative: supersedes message_start's 5
+            }
+            return web.Response(text=sse([*STREAM[:3], refusal]), content_type="text/event-stream")
         if self.mode == "bad_usage":
             return web.json_response(message(usage={"input_tokens": "lots", "output_tokens": 2}))
         if self.mode == "bad_json":
@@ -303,3 +310,14 @@ async def test_invalid_usage_count_is_a_retryable_bad_response(fake):
     finally:
         await p.aclose()
     assert exc.value.kind == "bad_response" and exc.value.retryable
+
+
+async def test_stream_refusal_carries_the_final_cumulative_usage(fake):
+    fake.mode = "stream_refusal"
+    p = make(fake)
+    try:
+        with pytest.raises(ProviderError) as exc:
+            [c async for c in p.stream(REQ)]
+    finally:
+        await p.aclose()
+    assert exc.value.kind == "content_policy" and exc.value.usage == (9, 2)

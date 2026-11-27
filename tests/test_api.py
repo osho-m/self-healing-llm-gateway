@@ -449,3 +449,52 @@ async def test_refusal_charges_the_usage_the_provider_billed(policy_file, stream
     assert exc.value.status_code == 400
     spent, _ = await store.budget_status(team.team_id)
     assert spent == pytest.approx((1000 * 1.0 + 500 * 2.0) / 1e6)  # primary's prices, not $0
+
+
+async def test_provider_configured_after_admission_is_skipped(policy_file, monkeypatch):
+    """No budget was reserved for it, so it must not be called for this request."""
+    from app.audit import AuditLog
+    from app.gateway import Gateway
+    from app.observability import Metrics
+    from app.policy import PolicyManager
+    from app.schemas import ChatMessage, ChatRequest
+    from app.stores import MemoryStore
+
+    monkeypatch.delenv("LATE_KEY", raising=False)
+    data = policy_dict()
+    data["providers"][0]["api_key_env"] = "LATE_KEY"  # primary starts unconfigured
+    manager = PolicyManager(policy_file(data))
+    gw = Gateway(manager, MemoryStore(), Metrics(), AuditLog(None))
+    req = ChatRequest(model="balanced", messages=[ChatMessage(role="user", content="hi")], max_tokens=16)
+    adm = await gw.admit(manager.policy.teams[0], req)
+    assert set(adm.output_caps) == {"secondary"}
+    monkeypatch.setenv("LATE_KEY", "now-set")  # primary becomes configured before routing
+    provider, _ = await gw.route(adm)
+    assert provider == "secondary" and "primary: not admitted" in adm.attempts
+
+
+async def test_mid_stream_refusals_do_not_open_the_shared_circuit(policy_file):
+    from app.audit import AuditLog
+    from app.gateway import Gateway
+    from app.observability import Metrics
+    from app.policy import PolicyManager
+    from app.providers import ProviderError, StreamChunk
+    from app.schemas import ChatMessage, ChatRequest
+    from app.stores import MemoryStore
+
+    manager = PolicyManager(policy_file(policy_dict()))
+    gw = Gateway(manager, MemoryStore(), Metrics(), AuditLog(None))
+    threshold = manager.policy.resilience.circuit_failure_threshold
+
+    async def refuse_after_text(creq):
+        yield StreamChunk(delta="partial")
+        raise ProviderError("primary", "content_policy", "refused", retryable=False, usage=(10, 5))
+
+    gw.providers["primary"].stream = refuse_after_text
+    req = ChatRequest(model="balanced", messages=[ChatMessage(role="user", content="hi")], max_tokens=16)
+    for _ in range(threshold + 1):
+        adm = await gw.admit(manager.policy.teams[0], req)
+        provider, body = await gw.stream(adm)
+        frames = b"".join([f async for f in body])
+        assert provider == "primary" and b"upstream_stream_error" in frames
+    assert gw.breakers["primary"].current_state() == "closed"
