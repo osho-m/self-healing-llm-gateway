@@ -21,6 +21,7 @@ import json as jsonlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
+from urllib.request import getproxies
 
 import httpx
 
@@ -61,12 +62,25 @@ def _translate(exc: BaseException) -> Exception:
     return exc  # type: ignore[return-value]
 
 
+def _reject_https_scheme_proxies() -> None:
+    """aiohttp ignores https:// proxy URLs from the environment (logging a warning) and would then
+    connect directly, bypassing a proxy the deployment requires. Fail at startup instead."""
+    bad = {k: v for k, v in getproxies().items() if k in ("http", "https") and v.lower().startswith("https://")}
+    if bad:
+        raise ValueError(
+            f"Unsupported proxy configuration {sorted(bad)}: https:// proxy URLs are not supported by the "
+            "provider HTTP client. Use an http:// proxy URL (traffic to providers is still TLS end to end "
+            "through the CONNECT tunnel), or unset the variable."
+        )
+
+
 class AiohttpClient:
     """Lazily creates one pooled aiohttp session inside the running event loop."""
 
     def __init__(self, max_connections: int = 1000, max_per_host: int = 0) -> None:
         self.max_connections, self.max_per_host = max_connections, max_per_host
         self._session = None
+        _reject_https_scheme_proxies()
 
     def _get_session(self):
         if self._session is None or self._session.closed:
@@ -90,6 +104,9 @@ class AiohttpClient:
                 timeout=aiohttp.ClientTimeout(total=timeout),
                 allow_redirects=False,
             ) as resp:
+                if 300 <= resp.status < 400:
+                    # Redirects are rejected by status alone; never wait on a (possibly stalled) body.
+                    return HttpResponse(resp.status, b"")
                 return HttpResponse(resp.status, await resp.read())
         except (TimeoutError, aiohttp.ClientError) as exc:
             raise _translate(exc) from exc

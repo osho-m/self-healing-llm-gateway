@@ -73,7 +73,9 @@ class OpenAICompatibleProvider(Provider):
                 timeout=self.config.timeout_s,
             ) as resp:
                 if not 200 <= resp.status_code < 300:
-                    body = (await resp.aread()).decode(errors="replace")
+                    # Classify redirects by status alone: never wait on a (possibly stalled) body.
+                    redirect = 300 <= resp.status_code < 400
+                    body = "" if redirect else (await resp.aread()).decode(errors="replace")
                     raise error_from_status(self.name, resp.status_code, body)
                 async for _event, data in iter_sse(resp):
                     if data.strip() == "[DONE]":

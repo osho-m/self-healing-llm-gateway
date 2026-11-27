@@ -133,3 +133,39 @@ async def test_session_trusts_proxy_environment():
         assert client._get_session().trust_env is True
     finally:
         await client.aclose()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_redirect_with_stalled_body_fails_fast_and_non_retryable(stream):
+    async def stalled_redirect(request: web.Request) -> web.StreamResponse:
+        resp = web.StreamResponse(
+            status=307, headers={"Location": "http://elsewhere.invalid/", "Content-Length": "100"}
+        )
+        await resp.prepare(request)
+        await asyncio.sleep(5)  # never send the promised body
+        return resp
+
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", stalled_redirect)
+    srv = TestServer(app)
+    await srv.start_server()
+    client = AiohttpClient()
+    try:
+        p = provider(str(srv.make_url("/v1")), client, timeout_s=0.5)
+        with pytest.raises(ProviderError) as exc:
+            if stream:
+                [c async for c in p.stream(REQ)]
+            else:
+                await p.complete(REQ)
+        assert exc.value.kind == "unexpected_redirect" and not exc.value.retryable
+    finally:
+        await client.aclose()
+        await srv.close()
+
+
+def test_https_scheme_proxy_is_rejected_not_silently_bypassed(monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "https://proxy.internal:8443")
+    with pytest.raises(ValueError, match="https:// proxy"):
+        AiohttpClient()
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
+    AiohttpClient()
