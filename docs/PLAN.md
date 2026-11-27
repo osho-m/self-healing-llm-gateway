@@ -52,6 +52,6 @@ Each step was small and tested before the next one started.
 - **Apps ask for a tier, not a model.** Each tier has its own fallback order, so apps never depend on one vendor.
 - **Budgets are reserved first and settled after.** Checking only after a call cannot stop parallel or streaming requests from overspending.
 - **Two kinds of fake outage.** The gateway can fake an outage for demos, and the mock model server can return real HTTP errors (`POST /fault`) so CI tests the real error path.
-- **Gateway copies share circuit opens through Redis.** When one copy opens a model's circuit, it writes a Redis key that expires with the cooldown, and the other copies open the same circuit within about a second. Only opens are shared: each copy still counts its own failures, so the request path never waits on Redis for this.
+- **Gateway copies can share circuit opens through Redis.** This is opt-in: it needs `share_circuit_state` turned on and every copy pointed at the same Redis. When one copy opens a model's circuit, it writes a Redis key that expires with the cooldown, and the other copies open the same circuit within about a second. Only opens are shared: each copy still counts its own failures, so the request path never waits on Redis for this.
 - **The demo runs the real gateway code.** `demo.py` imports `app.gateway`, so the demo can never drift from what ships.
 - **Open-source models by default.** Every shipped setup runs SmolLM2, Qwen2.5 and Phi-3.5. Paid APIs are optional and turn on only when their key is set.

@@ -87,7 +87,9 @@ Every pull request runs lint and type checks, the tests on Python 3.11 to 3.13 a
 
 ## Sharing circuits between gateway copies
 
-When you run several copies of the gateway behind a load balancer, turn on `share_circuit_state` in the policy's `resilience` section (the Docker Compose setup does). When one copy opens a model's circuit, it writes a key to Redis that expires when the cooldown ends. Every other copy checks Redis every `circuit_sync_interval_s` seconds (default 1) and opens the same circuit, so all copies stop calling the broken model together and test it again at about the same time.
+When you run several copies of the gateway behind a load balancer, point every copy at the same Redis with `GATEWAY_REDIS_URL`, and turn on `share_circuit_state` in the policy's `resilience` section. The Docker Compose setup does both. Without Redis, each copy keeps its own in-memory store and nothing is shared.
+
+When one copy opens a model's circuit, it writes a key to Redis that expires when the cooldown ends. Every other copy checks Redis every `circuit_sync_interval_s` seconds (default 1) and opens the same circuit, so all copies stop calling the broken model together and test it again at about the same time. The check must run more often than the cooldown, so the policy is rejected if `circuit_sync_interval_s` is not shorter than `circuit_cooldown_s`.
 
 Only opens are shared. Each copy still counts its own failures, so a request never waits on Redis for this. After the cooldown each copy sends its own test request, so a fleet of N copies sends at most N. Leave the setting off when copies should stay independent, as in the Hugging Face demo, where each visitor's outage switch must affect only that visitor.
 

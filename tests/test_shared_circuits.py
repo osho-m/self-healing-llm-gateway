@@ -91,3 +91,21 @@ def test_expired_records_are_ignored(remaining):
     breaker = CircuitBreaker("p", 1, 30, 20)
     breaker.adopt_open(remaining)
     assert breaker.current_state() == CLOSED
+
+
+def test_remaining_time_longer_than_the_local_cooldown_is_honoured():
+    now = [100.0]
+    breaker = CircuitBreaker("p", 1, 30, 15, clock=lambda: now[0])
+    breaker.adopt_open(30.0)  # another replica has a longer cooldown during a rolling update
+    now[0] += 20.0
+    assert breaker.current_state() == OPEN  # still open after this replica's own 15 s
+    now[0] += 10.0
+    assert breaker.current_state() == HALF_OPEN
+
+
+def test_policy_rejects_a_sync_interval_that_could_miss_a_shared_open():
+    from app.policy import ResiliencePolicy
+
+    with pytest.raises(ValueError, match="shorter than circuit_cooldown_s"):
+        ResiliencePolicy(share_circuit_state=True, circuit_sync_interval_s=20, circuit_cooldown_s=15)
+    ResiliencePolicy(share_circuit_state=False, circuit_sync_interval_s=20, circuit_cooldown_s=15)

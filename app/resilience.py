@@ -97,7 +97,8 @@ class CircuitBreaker:
             return
         self._failures.clear()
         self._probe_in_flight = False
-        self._opened_at = self._clock() - max(0.0, self.cooldown_s - remaining_s)
+        # Half-open at now + remaining_s, even when that is longer than this replica's own cooldown.
+        self._opened_at = self._clock() - (self.cooldown_s - remaining_s)
         self._transition(OPEN)
 
     def release(self) -> None:

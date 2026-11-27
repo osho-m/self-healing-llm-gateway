@@ -108,6 +108,13 @@ class ResiliencePolicy(BaseModel):
     down_error_rate: float = Field(default=0.5, ge=0, le=1)
     degraded_p99_ms: float = Field(default=5000.0, gt=0)
 
+    @model_validator(mode="after")
+    def _sync_faster_than_cooldown(self) -> ResiliencePolicy:
+        # A shared open lives for one cooldown; replicas that poll less often could miss it entirely.
+        if self.share_circuit_state and self.circuit_sync_interval_s >= self.circuit_cooldown_s:
+            raise ValueError("circuit_sync_interval_s must be shorter than circuit_cooldown_s when sharing circuits")
+        return self
+
 
 class Policy(BaseModel):
     providers: list[ProviderConfig]
