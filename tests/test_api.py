@@ -380,3 +380,34 @@ async def test_retired_adapter_closes_only_after_in_flight_calls_finish():
     assert closed == []  # still in use
     await p.release()
     assert closed == [True]
+
+
+async def test_reload_cannot_raise_the_sent_output_cap_above_the_admission_reservation(policy_file):
+    from app.audit import AuditLog
+    from app.gateway import Gateway
+    from app.observability import Metrics
+    from app.policy import PolicyManager
+    from app.schemas import ChatMessage, ChatRequest
+    from app.stores import MemoryStore
+
+    manager = PolicyManager(policy_file(policy_dict()))
+    gw = Gateway(manager, MemoryStore(), Metrics(), AuditLog(None))
+    team = manager.team(manager.policy.teams[0].team_id)
+    adm = await gw.admit(
+        team, ChatRequest(model="balanced", messages=[ChatMessage(role="user", content="hi")], max_tokens=16)
+    )
+    assert adm.output_cap == 16
+    sent = []
+    adapter = gw.providers["primary"]
+    original = adapter.complete
+
+    async def record(creq):
+        sent.append(creq.max_tokens)
+        return await original(creq)
+
+    adapter.complete = record
+    # A reload after admission raises the provider's floor far above what was reserved.
+    manager.policy.provider("primary").min_max_tokens = 4096
+    await gw._invoke("primary", adm.creq, adm.output_cap)
+    assert sent == [16]  # capped at the admission-time reservation
+    assert gw._sized("primary", adm.creq, None).max_tokens == 4096  # probes (no reservation) get the floor

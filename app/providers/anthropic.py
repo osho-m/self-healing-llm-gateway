@@ -13,6 +13,7 @@ where a request goes next, and keeps cost accounting per provider.
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -36,7 +37,40 @@ _RETRYABLE_STREAM_ERRORS = {
     "rate_limit_error": "rate_limited",
     "timeout_error": "timeout",
 }
-_TRANSPORT_ERRORS = (anthropic.AnthropicError, httpx2.TransportError, aiohttp.ClientError, TimeoutError)
+
+
+class _RedirectRejected(Exception):
+    """Raised from a response hook as soon as a 3xx arrives, before the SDK reads its body."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__(f"HTTP {status} redirect not followed")
+        self.status = status
+
+
+async def _reject_redirects(response: httpx2.Response) -> None:
+    # Runs on headers. Reading a redirect's body first would let a stalled body turn a
+    # non-retryable misconfiguration into a retryable timeout.
+    if 300 <= response.status_code < 400:
+        raise _RedirectRejected(response.status_code)
+
+
+def _redirect_cause(exc: BaseException) -> _RedirectRejected | None:
+    seen: BaseException | None = exc
+    while seen is not None:
+        if isinstance(seen, _RedirectRejected):
+            return seen
+        seen = seen.__cause__ or seen.__context__
+    return None
+
+
+_TRANSPORT_ERRORS = (
+    anthropic.AnthropicError,
+    httpx2.TransportError,
+    aiohttp.ClientError,
+    TimeoutError,
+    json.JSONDecodeError,
+    _RedirectRejected,
+)
 
 _FINISH = {"end_turn": "stop", "stop_sequence": "stop", "max_tokens": "length", "tool_use": "tool_calls"}
 
@@ -58,7 +92,10 @@ class AnthropicProvider(Provider):
                 max_retries=0,
                 timeout=self.config.timeout_s,
                 # Never follow redirects: a 307/308 would resend the full prompt to the target.
-                http_client=anthropic.DefaultAioHttpClient(follow_redirects=False),
+                # The hook rejects a 3xx on its headers, before any body is read.
+                http_client=anthropic.DefaultAioHttpClient(
+                    follow_redirects=False, event_hooks={"response": [_reject_redirects]}
+                ),
             )
         return self._sdk
 
@@ -71,7 +108,8 @@ class AnthropicProvider(Provider):
         ]
         params: dict[str, Any] = {
             "model": self.config.model,
-            "max_tokens": max(request.max_tokens, self.config.min_max_tokens),
+            # The gateway already applied min_max_tokens, capped at what admission reserved.
+            "max_tokens": request.max_tokens,
             "messages": messages,
         }
         if system:
@@ -81,6 +119,13 @@ class AnthropicProvider(Provider):
         return params
 
     def _error(self, exc: Exception) -> ProviderError:
+        redirect = _redirect_cause(exc)
+        if redirect is not None:
+            return ProviderError(
+                self.name, "unexpected_redirect", str(redirect), retryable=False, status=redirect.status
+            )
+        if isinstance(exc, json.JSONDecodeError):
+            return ProviderError(self.name, "bad_response", f"malformed JSON from provider: {exc}", retryable=True)
         # Most specific first. APITimeoutError subclasses APIConnectionError.
         if isinstance(exc, anthropic.APITimeoutError):
             return ProviderError(self.name, "timeout", str(exc) or "timeout", retryable=True)

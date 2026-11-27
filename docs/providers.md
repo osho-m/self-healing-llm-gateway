@@ -49,12 +49,14 @@ The adapter uses the official SDK with `max_retries=0`, because the gateway owns
 
 **Errors:**
 - **Retried:** 429, 5xx (including 529 "overloaded"), timeouts and connection errors.
+- **Also retried:** malformed JSON in a response or stream (`bad_response`).
 - **Not retried:** authentication, permission and bad-request errors are returned immediately.
+- **Redirects** are never followed. A 3xx is rejected as soon as its headers arrive, before any body is read, as a non-retryable `unexpected_redirect`.
 
 **Request parameters:**
 - **Sampling parameters** such as `temperature` are not forwarded, because current Claude models reject them.
 - **`effort`** (`low` … `max`) sets the reasoning effort.
-- **`min_max_tokens`** sets a floor for `max_tokens`. Current Claude models always think, and thinking tokens count against `max_tokens`, so a very small cap can leave no room for the answer.
+- **`min_max_tokens`** sets a floor for `max_tokens`. Current Claude models always think, and thinking tokens count against `max_tokens`, so a very small cap can leave no room for the answer. The gateway applies the floor when it sizes each call and reserves rate-limit tokens and budget for it at admission. A policy reload between admission and the call cannot raise the sent cap above that reservation.
 
 **Model fallback** is decided by the gateway's tier chain, not by Anthropic's server-side fallbacks. That keeps spend accounting per provider and the routing policy in one place.
 

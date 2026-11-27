@@ -1,5 +1,6 @@
 """AnthropicProvider (official SDK) against a local fake of the Messages API, over a real socket."""
 
+import asyncio
 import json
 
 import pytest
@@ -77,6 +78,16 @@ class FakeAnthropic:
             )
         if self.mode == "redirect":
             raise web.HTTPTemporaryRedirect(location=self.redirect_to)
+        if self.mode == "redirect_stall":
+            # Headers arrive, the body never does.
+            resp = web.StreamResponse(status=307, headers={"Location": self.redirect_to, "Content-Length": "100"})
+            await resp.prepare(request)
+            await asyncio.sleep(30)
+            return resp
+        if self.mode == "bad_json":
+            if body.get("stream"):
+                return web.Response(text="event: message_start\ndata: {not json\n\n", content_type="text/event-stream")
+            return web.Response(text="{not json", content_type="application/json")
         if self.mode == "refusal":
             return web.json_response(
                 message(
@@ -132,7 +143,7 @@ def make(api, **cfg) -> AnthropicProvider:
 
 
 async def test_complete_maps_request_and_response(fake):
-    p = make(fake, effort="low", min_max_tokens=1024)
+    p = make(fake, effort="low")
     try:
         result = await p.complete(REQ)
     finally:
@@ -144,7 +155,7 @@ async def test_complete_maps_request_and_response(fake):
     body = sent["body"]
     assert body["system"] == "be brief"
     assert [m["role"] for m in body["messages"]] == ["user"]
-    assert body["max_tokens"] == 1024  # floor applied
+    assert body["max_tokens"] == 16  # sized by the gateway (floor capped at the admission reservation)
     assert body["output_config"] == {"effort": "low"}
     assert "temperature" not in body  # current Claude models reject sampling params
 
@@ -251,3 +262,30 @@ async def test_mid_stream_failures_are_retryable_provider_errors(fake, mode, kin
     finally:
         await p.aclose()
     assert exc.value.retryable and exc.value.kind in (kind, "timeout")
+
+
+async def test_redirect_is_rejected_on_headers_even_if_its_body_stalls(fake):
+    fake.mode = "redirect_stall"
+    fake.redirect_to = "http://example.invalid/stolen"
+    p = make(fake)
+    try:
+        with pytest.raises(ProviderError) as exc:
+            await asyncio.wait_for(p.complete(REQ), timeout=3)  # adapter timeout is 5 s
+    finally:
+        await p.aclose()
+    assert exc.value.kind == "unexpected_redirect" and not exc.value.retryable
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_malformed_json_is_a_retryable_bad_response(fake, streaming):
+    fake.mode = "bad_json"
+    p = make(fake)
+    try:
+        with pytest.raises(ProviderError) as exc:
+            if streaming:
+                [c async for c in p.stream(REQ)]
+            else:
+                await p.complete(REQ)
+    finally:
+        await p.aclose()
+    assert exc.value.kind == "bad_response" and exc.value.retryable

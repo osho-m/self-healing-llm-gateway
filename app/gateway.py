@@ -9,7 +9,7 @@ import random
 import time
 import uuid
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from app.audit import AuditLog
@@ -36,6 +36,8 @@ class Admission:
     reserved_usd: float
     started: float
     rate_headers: dict[str, str]
+    # Largest max_tokens admission reserved for; no provider call may send more.
+    output_cap: int = 0
     provider_time: float = 0.0
     attempts: list[str] = field(default_factory=list)
 
@@ -176,7 +178,8 @@ class Gateway:
             raise GatewayError(403, "tier_not_allowed", f"Team {team.team_id!r} may not use tier {req.model!r}.")
         messages = self._enrich(team, req)
         prompt_est = sum(estimate_tokens(m["content"]) for m in messages)
-        token_need = prompt_est + self._max_output_tokens(req.model, req.max_tokens)
+        output_cap = self._max_output_tokens(req.model, req.max_tokens)
+        token_need = prompt_est + output_cap
 
         estimate = self._max_cost(req.model, prompt_est, req.max_tokens)
         with tracer.start_as_current_span("gateway.admission") as span, self.metrics.store_duration.time():
@@ -216,11 +219,22 @@ class Gateway:
             "X-RateLimit-Remaining-Tokens": str(int(decision.remaining_tokens)),
         }
         creq = CompletionRequest(messages=messages, max_tokens=req.max_tokens, temperature=req.temperature)
-        return Admission(rid, team, req, creq, estimate, started, rate_headers)
+        return Admission(rid, team, req, creq, estimate, started, rate_headers, output_cap)
 
     # ------------------------------------------------------------------ provider invocation
 
-    async def _invoke(self, name: str, creq: CompletionRequest) -> CompletionResult:
+    def _sized(self, name: str, creq: CompletionRequest, cap: int | None) -> CompletionRequest:
+        """Apply the provider's min_max_tokens floor, never exceeding what admission reserved.
+
+        The floor is read from the current policy, so a reload between admission and the call could
+        raise it; ``cap`` (the admission-time reservation) keeps the request within budget.
+        """
+        tokens = max(creq.max_tokens, self.policy.provider(name).min_max_tokens)
+        if cap:
+            tokens = min(tokens, cap)
+        return creq if tokens == creq.max_tokens else replace(creq, max_tokens=tokens)
+
+    async def _invoke(self, name: str, creq: CompletionRequest, cap: int | None = None) -> CompletionResult:
         fault = self.faults.get(name)
         if fault.latency_ms:
             await asyncio.sleep(fault.latency_ms / 1000)
@@ -229,7 +243,7 @@ class Gateway:
         adapter = self.providers[name]
         adapter.acquire()
         try:
-            return await adapter.complete(creq)
+            return await adapter.complete(self._sized(name, creq, cap))
         finally:
             await adapter.release()
 
@@ -265,7 +279,7 @@ class Gateway:
                     span.set_attributes({"gateway.provider": name, "gateway.attempt": attempt})
                     t0 = time.perf_counter()
                     try:
-                        result = await self._invoke(name, adm.creq)
+                        result = await self._invoke(name, adm.creq, adm.output_cap)
                     except ProviderError as err:
                         elapsed = time.perf_counter() - t0
                         adm.provider_time += elapsed
@@ -393,7 +407,7 @@ class Gateway:
     # ------------------------------------------------------------------ streaming
 
     async def _open_stream(
-        self, name: str, creq: CompletionRequest
+        self, name: str, creq: CompletionRequest, cap: int | None = None
     ) -> tuple[list[StreamChunk], AsyncIterator[StreamChunk], Provider]:
         """Start a provider stream and buffer until the first content delta, so failover stays invisible."""
         fault = self.faults.get(name)
@@ -404,7 +418,7 @@ class Gateway:
         adapter = self.providers[name]
         adapter.acquire()  # released by _sse when the stream ends, or below if opening fails
         try:
-            agen = adapter.stream(creq).__aiter__()
+            agen = adapter.stream(self._sized(name, creq, cap)).__aiter__()
             buffered: list[StreamChunk] = []
             async for chunk in agen:
                 buffered.append(chunk)
@@ -429,7 +443,7 @@ class Gateway:
             for attempt in range(res.max_retries + 1):
                 t0 = time.perf_counter()
                 try:
-                    buffered, agen, adapter = await self._open_stream(name, adm.creq)
+                    buffered, agen, adapter = await self._open_stream(name, adm.creq, adm.output_cap)
                 except ProviderError as err:
                     elapsed = time.perf_counter() - t0
                     adm.provider_time += elapsed
