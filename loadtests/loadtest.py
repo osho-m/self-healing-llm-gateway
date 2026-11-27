@@ -125,7 +125,10 @@ async def main() -> None:
                         statuses[str(r.status)] += 1
                         if r.status == 200:
                             providers[r.headers.get("X-Gateway-Provider", "?")] += 1
-                            latencies.append(time.perf_counter() - t0)
+                            # Open loop: measure from the scheduled arrival, so time queued behind the
+                            # concurrency cap counts (avoids coordinated omission).
+                            arrival = t_start + i / args.rate if args.rate else t0
+                            latencies.append(time.perf_counter() - arrival)
                 except (aiohttp.ClientError, TimeoutError) as exc:
                     statuses[type(exc).__name__] += 1
             done += 1

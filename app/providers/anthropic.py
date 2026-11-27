@@ -56,7 +56,7 @@ class AnthropicProvider(Provider):
             resp = await self.client.post(
                 self._url(), json=self._payload(request, False), headers=self._headers(), timeout=self.config.timeout_s
             )
-            if resp.status_code >= 400:
+            if not 200 <= resp.status_code < 300:
                 raise error_from_status(self.name, resp.status_code, resp.text)
             data = resp.json()
             text = "".join(block.get("text", "") for block in data.get("content", []) if block.get("type") == "text")
@@ -83,8 +83,10 @@ class AnthropicProvider(Provider):
                 headers=self._headers(),
                 timeout=self.config.timeout_s,
             ) as resp:
-                if resp.status_code >= 400:
-                    body = (await resp.aread()).decode(errors="replace")
+                if not 200 <= resp.status_code < 300:
+                    # Classify redirects by status alone: never wait on a (possibly stalled) body.
+                    redirect = 300 <= resp.status_code < 400
+                    body = "" if redirect else (await resp.aread()).decode(errors="replace")
                     raise error_from_status(self.name, resp.status_code, body)
                 async for event, data in iter_sse(resp):
                     obj = json.loads(data)
