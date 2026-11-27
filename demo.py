@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections import OrderedDict
 
 import gradio as gr
@@ -35,6 +36,8 @@ MAX_SESSIONS = 256
 # One gateway (limits, budgets, circuits, fault switches) per browser session, so one visitor's
 # outage toggle or rate-limit usage never affects another. Least recently used sessions are evicted.
 _sessions: OrderedDict[str, Gateway] = OrderedDict()
+# Gradio runs sync handlers in worker threads and async ones on the event loop.
+_sessions_lock = threading.Lock()
 
 
 def _new_gateway() -> Gateway:
@@ -43,13 +46,14 @@ def _new_gateway() -> Gateway:
 
 def gateway_for(request: gr.Request | None) -> Gateway:
     key = getattr(request, "session_hash", None) or "local"
-    gateway = _sessions.get(key)
-    if gateway is None:
-        gateway = _sessions[key] = _new_gateway()
-        if len(_sessions) > MAX_SESSIONS:
-            _sessions.popitem(last=False)
-    else:
-        _sessions.move_to_end(key)
+    with _sessions_lock:
+        gateway = _sessions.get(key)
+        if gateway is None:
+            gateway = _sessions[key] = _new_gateway()
+            if len(_sessions) > MAX_SESSIONS:
+                _sessions.popitem(last=False)
+        else:
+            _sessions.move_to_end(key)
     return gateway
 
 

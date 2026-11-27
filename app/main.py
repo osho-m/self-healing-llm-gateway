@@ -95,7 +95,11 @@ def create_app(
     setup_logging(settings.log_level, settings.log_json)
     setup_tracing(settings.otel_service_name, settings.otel_exporter_otlp_endpoint, settings.otel_sample_ratio)
 
-    policy = policy or PolicyManager(settings.policy_path, forbid_plaintext_keys=settings.environment == "production")
+    production = settings.environment == "production"
+    if policy is None:
+        policy = PolicyManager(settings.policy_path, forbid_plaintext_keys=production)
+    elif production and not policy.forbid_plaintext_keys:
+        raise ValueError("in production the PolicyManager must be created with forbid_plaintext_keys=True")
     if store is None:
         store = (
             RedisStore(settings.redis_url, max_connections=settings.redis_max_connections)
