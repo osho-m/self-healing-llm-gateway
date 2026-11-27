@@ -18,9 +18,20 @@ RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504, 529}
 class ProviderError(Exception):
     """Normalized provider failure. ``retryable`` drives retry/fallback decisions."""
 
-    def __init__(self, provider: str, kind: str, message: str, *, retryable: bool, status: int | None = None) -> None:
+    def __init__(
+        self,
+        provider: str,
+        kind: str,
+        message: str,
+        *,
+        retryable: bool,
+        status: int | None = None,
+        usage: tuple[int, int] | None = None,
+    ) -> None:
         super().__init__(f"{provider}: {kind}: {message}")
         self.provider, self.kind, self.retryable, self.status = provider, kind, retryable, status
+        # (prompt_tokens, completion_tokens) the provider billed for a failed call, e.g. a refusal.
+        self.usage = usage
 
 
 def error_from_status(provider: str, status: int, body: str) -> ProviderError:

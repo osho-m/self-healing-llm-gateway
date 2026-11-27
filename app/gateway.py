@@ -39,6 +39,8 @@ class Admission:
     # max_tokens each provider in the chain was admitted with (its min_max_tokens floor applied at
     # admission time). Calls use these, so a later policy reload cannot exceed the reservation.
     output_caps: dict[str, int] = field(default_factory=dict)
+    # Cost a provider billed for a call that failed without retry (e.g. a refusal); settled instead of 0.
+    failed_cost_usd: float = 0.0
     provider_time: float = 0.0
     attempts: list[str] = field(default_factory=list)
 
@@ -259,6 +261,9 @@ class Gateway:
         self.metrics.provider_latency.labels(name).observe(seconds)
         self._evaluate_health(name)
 
+    def _billed(self, name: str, err: ProviderError) -> float:
+        return self.policy.provider(name).cost_usd(*err.usage) if err.usage else 0.0
+
     def _non_retryable(self, err: ProviderError) -> GatewayError:
         if err.kind == "content_policy":
             return GatewayError(
@@ -292,6 +297,7 @@ class Gateway:
                         adm.attempts.append(f"{name}: {err.kind}")
                         if not err.retryable:
                             breaker.release()
+                            adm.failed_cost_usd = self._billed(name, err)
                             raise self._non_retryable(err) from err
                         breaker.record_failure()
                         if breaker.state != CLOSED or attempt == res.max_retries:
@@ -324,7 +330,7 @@ class Gateway:
             try:
                 provider, result = await self.route(adm)
             except GatewayError as exc:
-                await self.store.settle_budget(team.team_id, adm.reserved_usd, 0.0)
+                await self.store.settle_budget(team.team_id, adm.reserved_usd, adm.failed_cost_usd)
                 self.metrics.requests.labels(team.team_id, tier, "none", str(exc.status_code), adm.req.priority).inc()
                 raise
             content = result.content
@@ -455,7 +461,8 @@ class Gateway:
                     adm.attempts.append(f"{name}: {err.kind}")
                     if not err.retryable:
                         breaker.release()
-                        await self.store.settle_budget(adm.team.team_id, adm.reserved_usd, 0.0)
+                        cost = self._billed(name, err)
+                        await self.store.settle_budget(adm.team.team_id, adm.reserved_usd, cost)
                         raise self._non_retryable(err) from err
                     breaker.record_failure()
                     if breaker.state != CLOSED or attempt == res.max_retries:
@@ -556,6 +563,10 @@ class Gateway:
             yield b"data: [DONE]\n\n"
             self._observe(adm, provider, time.perf_counter() - adm.started)
         except ProviderError as err:
+            if err.usage:  # the provider reported what it billed (e.g. a refusal): charge exactly that
+                cost = self._billed(provider, err)
+                await self.store.settle_budget(team.team_id, adm.reserved_usd, cost)
+                settled = True
             breaker.record_failure()
             self._record(provider, False, time.perf_counter() - t0, err)
             self.metrics.errors.labels(team.team_id, tier, provider, f"stream_{err.kind}").inc()
