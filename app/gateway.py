@@ -166,12 +166,12 @@ class Gateway:
         chain = [self.policy.provider(p) for p in self.policy.tiers[tier]]
         return [c for c in chain if self._configured(c.name)] or chain
 
-    def _max_cost(self, tier: str, prompt_tokens: int, max_tokens: int) -> float:
+    def _max_cost(self, chain: list, prompt_tokens: int, max_tokens: int) -> float:
         # Each provider may raise max_tokens to its floor (min_max_tokens); reserve for that.
-        return max(c.cost_usd(prompt_tokens, max(max_tokens, c.min_max_tokens)) for c in self._chain_configs(tier))
+        return max(c.cost_usd(prompt_tokens, max(max_tokens, c.min_max_tokens)) for c in chain)
 
-    def _output_caps(self, tier: str, max_tokens: int) -> dict[str, int]:
-        return {c.name: max(max_tokens, c.min_max_tokens) for c in self._chain_configs(tier)}
+    def _output_caps(self, chain: list, max_tokens: int) -> dict[str, int]:
+        return {c.name: max(max_tokens, c.min_max_tokens) for c in chain}
 
     async def admit(self, team: TeamPolicy, req: ChatRequest) -> Admission:
         started = time.perf_counter()
@@ -182,10 +182,11 @@ class Gateway:
             raise GatewayError(403, "tier_not_allowed", f"Team {team.team_id!r} may not use tier {req.model!r}.")
         messages = self._enrich(team, req)
         prompt_est = sum(estimate_tokens(m["content"]) for m in messages)
-        output_caps = self._output_caps(req.model, req.max_tokens)
+        chain = self._chain_configs(req.model)  # one snapshot for both the caps and the cost estimate
+        output_caps = self._output_caps(chain, req.max_tokens)
         token_need = prompt_est + max(output_caps.values())
 
-        estimate = self._max_cost(req.model, prompt_est, req.max_tokens)
+        estimate = self._max_cost(chain, prompt_est, req.max_tokens)
         with tracer.start_as_current_span("gateway.admission") as span, self.metrics.store_duration.time():
             decision, budget = await self.store.admit(
                 team.team_id,
@@ -294,6 +295,9 @@ class Gateway:
                 adm.attempts.append(f"{name}: circuit {breaker.state}")
                 continue
             for attempt in range(res.max_retries + 1):
+                if attempt and not self._configured(name):  # e.g. a local model unloaded during backoff
+                    adm.attempts.append(f"{name}: no longer available")
+                    break
                 with tracer.start_as_current_span("gateway.llm_call") as span:
                     span.set_attributes({"gateway.provider": name, "gateway.attempt": attempt})
                     t0 = time.perf_counter()
@@ -469,6 +473,9 @@ class Gateway:
                 adm.attempts.append(f"{name}: circuit {breaker.state}")
                 continue
             for attempt in range(res.max_retries + 1):
+                if attempt and not self._configured(name):  # e.g. a local model unloaded during backoff
+                    adm.attempts.append(f"{name}: no longer available")
+                    break
                 t0 = time.perf_counter()
                 try:
                     buffered, agen, adapter = await self._open_stream(name, adm.creq, adm.output_caps)

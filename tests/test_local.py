@@ -89,3 +89,25 @@ def test_registered_local_model_serves_and_fails_over(make_client, model):
     assert r.json()["choices"][0]["message"]["content"] == "local answer here"
     admin(client, "POST", "/v1/admin/providers/gpu/simulate-outage", params={"enabled": "true"})
     assert chat(client).json()["x_gateway"]["provider"] == "primary"
+
+
+def test_model_unloaded_during_backoff_fails_over_instead_of_502(make_client):
+    name = "test/unloads-itself"
+
+    def generate(messages, max_tokens):
+        unregister_local_model(name)  # the model goes away while the gateway backs off
+        raise RuntimeError("CUDA error")
+
+    register_local_model(name, generate)
+    try:
+        data = policy_dict()
+        data["providers"].insert(0, {"name": "gpu", "kind": "local", "model": name})
+        data["tiers"]["balanced"] = ["gpu", "primary"]
+        client = make_client(data)
+        r = chat(client)
+    finally:
+        unregister_local_model(name)
+    assert r.status_code == 200
+    meta = r.json()["x_gateway"]
+    assert meta["provider"] == "primary"
+    assert meta["attempts"] == ["gpu: local_runtime", "gpu: no longer available"]
