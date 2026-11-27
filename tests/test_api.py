@@ -411,3 +411,41 @@ async def test_reload_cannot_raise_the_sent_output_cap_above_the_admission_reser
     await gw._invoke("primary", adm.creq, adm.output_caps)
     assert sent == [16]  # capped at the admission-time reservation
     assert gw._sized("primary", adm.creq, None).max_tokens == 4096  # probes (no reservation) get the floor
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_refusal_charges_the_usage_the_provider_billed(policy_file, streaming):
+    from app.audit import AuditLog
+    from app.errors import GatewayError
+    from app.gateway import Gateway
+    from app.observability import Metrics
+    from app.policy import PolicyManager
+    from app.providers import ProviderError
+    from app.schemas import ChatMessage, ChatRequest
+    from app.stores import MemoryStore
+
+    manager = PolicyManager(policy_file(policy_dict()))
+    store = MemoryStore()
+    gw = Gateway(manager, store, Metrics(), AuditLog(None))
+    team = manager.policy.teams[0]
+    refusal = ProviderError("primary", "content_policy", "refused", retryable=False, usage=(1000, 500))
+
+    async def refuse(creq):
+        raise refusal
+
+    async def refuse_stream(creq):
+        raise refusal
+        yield  # pragma: no cover
+
+    gw.providers["primary"].complete = refuse
+    gw.providers["primary"].stream = refuse_stream
+    req = ChatRequest(model="balanced", messages=[ChatMessage(role="user", content="hi")], max_tokens=16)
+    adm = await gw.admit(team, req)
+    with pytest.raises(GatewayError) as exc:
+        if streaming:
+            await gw.stream(adm)
+        else:
+            await gw.complete(adm)
+    assert exc.value.status_code == 400
+    spent, _ = await store.budget_status(team.team_id)
+    assert spent == pytest.approx((1000 * 1.0 + 500 * 2.0) / 1e6)  # primary's prices, not $0

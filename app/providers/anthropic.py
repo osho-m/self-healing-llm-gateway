@@ -88,7 +88,8 @@ class AnthropicProvider(Provider):
                 )
             self._sdk = anthropic.AsyncAnthropic(
                 api_key=key,
-                base_url=self.config.base_url or None,
+                # Explicit, so an ambient ANTHROPIC_BASE_URL cannot redirect the key and prompts.
+                base_url=self.config.base_url or "https://api.anthropic.com",
                 max_retries=0,
                 timeout=self.config.timeout_s,
                 # Never follow redirects: a 307/308 would resend the full prompt to the target.
@@ -147,9 +148,12 @@ class AnthropicProvider(Provider):
             return ProviderError(self.name, "connection", str(exc) or type(exc).__name__, retryable=True)
         return ProviderError(self.name, "unknown", repr(exc), retryable=False)
 
-    def _refusal(self, details: Any) -> ProviderError:
+    def _refusal(self, details: Any, usage: tuple[int, int] | None) -> ProviderError:
+        # A refusal is billed; carry the reported usage so the gateway charges it to the budget.
         category = getattr(details, "category", None) or "unspecified"
-        return ProviderError(self.name, "content_policy", f"model refused (category: {category})", retryable=False)
+        return ProviderError(
+            self.name, "content_policy", f"model refused (category: {category})", retryable=False, usage=usage
+        )
 
     def _tokens(self, value: Any) -> int:
         # The SDK does not validate response models strictly; a bad count must not break settlement.
@@ -163,7 +167,8 @@ class AnthropicProvider(Provider):
         except _TRANSPORT_ERRORS as exc:
             raise self._error(exc) from exc
         if message.stop_reason == "refusal":
-            raise self._refusal(message.stop_details)
+            usage = (self._tokens(message.usage.input_tokens), self._tokens(message.usage.output_tokens))
+            raise self._refusal(message.stop_details, usage)
         text = "".join(block.text for block in message.content if block.type == "text")
         return CompletionResult(
             content=text,
@@ -174,16 +179,19 @@ class AnthropicProvider(Provider):
         )
 
     async def stream(self, request: CompletionRequest) -> AsyncIterator[StreamChunk]:
+        prompt_tokens = 0
         try:
             async with self._client().messages.stream(**self._params(request)) as stream:
                 async for event in stream:
                     if event.type == "message_start":
-                        yield StreamChunk(prompt_tokens=self._tokens(event.message.usage.input_tokens))
+                        prompt_tokens = self._tokens(event.message.usage.input_tokens)
+                        yield StreamChunk(prompt_tokens=prompt_tokens)
                     elif event.type == "content_block_delta" and event.delta.type == "text_delta":
                         yield StreamChunk(delta=event.delta.text)
                     elif event.type == "message_delta":
                         if event.delta.stop_reason == "refusal":
-                            raise self._refusal(getattr(event.delta, "stop_details", None))
+                            usage = (prompt_tokens, self._tokens(event.usage.output_tokens))
+                            raise self._refusal(getattr(event.delta, "stop_details", None), usage)
                         reason = event.delta.stop_reason or ""
                         yield StreamChunk(
                             completion_tokens=self._tokens(event.usage.output_tokens),

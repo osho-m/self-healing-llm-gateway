@@ -45,7 +45,7 @@ The adapter uses the official SDK with `max_retries=0`, because the gateway owns
 | Text content blocks | the response content (other block types, such as thinking, are dropped) |
 | Usage | the provider's real token counts |
 | `max_tokens` stop reason | finish reason `length` |
-| Refusal (`stop_reason: "refusal"`) | non-retryable `content_policy` error (HTTP 400 to the client), never an empty success |
+| Refusal (`stop_reason: "refusal"`) | non-retryable `content_policy` error (HTTP 400 to the client), never an empty success. The usage Anthropic reports for the refused call is still charged to the team's budget. |
 
 **Errors:**
 - **Retried:** 429, 5xx (including 529 "overloaded"), timeouts and connection errors.

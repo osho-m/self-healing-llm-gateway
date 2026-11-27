@@ -199,6 +199,7 @@ async def test_refusal_is_a_non_retryable_content_policy_error(fake):
         await p.aclose()
     assert exc.value.kind == "content_policy" and not exc.value.retryable
     assert "cyber" in str(exc.value)
+    assert exc.value.usage == (9, 2)  # billed usage is carried for budget settlement
 
 
 async def test_cross_origin_redirect_never_receives_the_api_key(fake):
