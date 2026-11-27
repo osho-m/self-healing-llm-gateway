@@ -7,9 +7,9 @@
 
 An OpenAI-compatible gateway that sits in front of every LLM call in an organization. It enforces per-team rate limits and dollar budgets, and keeps serving traffic when a model provider fails.
 
-**[Live demo](https://huggingface.co/spaces/oshom/self-healing-llm-gateway)** · [Benchmarks](docs/benchmarks.md) · [Real-model run](docs/real-model-run.md) · [Build plan](docs/PLAN.md) · [Security](SECURITY.md)
+**[Live demo](https://huggingface.co/spaces/oshom/self-healing-llm-gateway)** · [Providers](docs/providers.md) · [Benchmarks](docs/benchmarks.md) · [Real-model run](docs/real-model-run.md) · [Build plan](docs/PLAN.md) · [Security](SECURITY.md)
 
-![Primary outage: three retries, circuit opens, the fallback provider serves the request](docs/images/space-failover.png)
+![Live demo: Qwen2.5-1.5B-Instruct on ZeroGPU answers through the gateway](docs/images/space-normal.png)
 
 ## Why
 
@@ -31,7 +31,7 @@ This gateway handles all three in one place. Clients send a standard chat-comple
   - Traffic moves along a per-tier fallback chain.
   - Non-retryable errors are returned immediately and never fail over.
 - **Streaming.** SSE passthrough. Failover happens before the first byte, so clients never see a switch. Usage and cost are recorded from the assembled stream.
-- **Providers.** OpenAI-compatible APIs, the Anthropic Messages API, and Ollama. Adding a provider is a policy change, not a code change.
+- **Providers.** OpenAI-compatible APIs, the Anthropic Messages API through the official SDK, Ollama, and in-process models such as a Transformers model on a GPU. Adding a provider is a policy change, not a code change. A provider whose API key is not set is skipped, and the skip is reported, so optional paid tiers turn on when the key is supplied.
 - **Operations:**
   - YAML policy with hot reload, plus runtime overrides through an admin API.
   - Every admin change is written to an append-only audit log.
@@ -48,7 +48,8 @@ Measured, not estimated. Details and methodology are in [docs/benchmarks.md](doc
 | Capacity on a shared 4-vCPU CI runner | up to **630 req/s**, zero errors |
 | Throughput optimization | **83 → 463 req/s** on the same 2-vCPU runner, after finding and replacing an HTTP-client bottleneck |
 | Real provider outage (local Ollama process killed) | Connection errors opened the circuit and the fallback served the request; the circuit closed again after the provider returned ([details](docs/real-model-run.md)) |
-| Test suite | 74 tests on Python 3.11–3.13 against real Redis, with ruff and mypy clean |
+| Live demo with a real model | Qwen2.5-1.5B-Instruct on ZeroGPU served through the gateway (about 0.8 s warm, 2.9 s cold). Under a simulated outage the request failed over and was still answered; after the cooldown the model served again |
+| Test suite | 87 tests on Python 3.11–3.13 against real Redis, with ruff and mypy clean |
 
 ## Architecture
 
@@ -205,9 +206,21 @@ Every pull request runs these checks:
 
 ## Hugging Face Space
 
-The [live demo](https://huggingface.co/spaces/oshom/self-healing-llm-gateway) runs the same gateway engine in-process, so you can try it without Docker or API keys. You can send a request, simulate a primary-provider outage, and watch the retries, the open circuit and the fallback.
+The [live demo](https://huggingface.co/spaces/oshom/self-healing-llm-gateway) runs the same gateway engine in-process, so no Docker is needed. The policy is in `config/policy.space.yml`.
 
-Each visitor gets an isolated gateway. The demo's providers are deterministic mocks, so outages and failovers are reproducible.
+For the default tier, the gateway tries providers in this order:
+
+1. **Qwen2.5-1.5B-Instruct** (Apache-2.0), running in the Space on ZeroGPU. `demo.py` loads it and registers it as a `kind: local` provider.
+2. **Claude** (`claude-opus-5-5`), only when the Space owner sets the `ANTHROPIC_API_KEY` secret. It runs at low effort with no background probes, and the demo team's budget is $1 a day.
+3. **A deterministic fallback.** It keeps the demo answering when the real providers are unavailable, for example once a visitor's free ZeroGPU quota is used up.
+
+Each visitor's outage switch and circuit state are isolated. Rate limits and the daily budget are shared by all visitors, so opening a new tab cannot reset them.
+
+| Real model serving | Simulated outage: retries, open circuit, fallback serves |
+| --- | --- |
+| ![Qwen2.5-1.5B-Instruct on ZeroGPU answers through the gateway](docs/images/space-normal.png) | ![Outage on the GPU provider: retries, then the fallback serves](docs/images/space-failover.png) |
+
+The Space is published from `main` with `scripts/sync_space.sh`, which prepends the Hugging Face metadata header to the README.
 
 ## Roadmap
 
