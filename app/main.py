@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gc
 import logging
 import uuid
 from contextlib import asynccontextmanager
@@ -92,7 +93,7 @@ def create_app(
 ) -> FastAPI:
     settings = settings or get_settings()
     setup_logging(settings.log_level, settings.log_json)
-    setup_tracing(settings.otel_service_name, settings.otel_exporter_otlp_endpoint)
+    setup_tracing(settings.otel_service_name, settings.otel_exporter_otlp_endpoint, settings.otel_sample_ratio)
 
     policy = policy or PolicyManager(settings.policy_path)
     if store is None:
@@ -114,6 +115,9 @@ def create_app(
             interval = gateway.policy.resilience.health_check_interval_s
             tasks.append(asyncio.create_task(_loop(interval, gateway.probe_all, "health")))
         await gateway.refresh_policy()
+        # Move startup objects (modules, policy, adapters) out of GC generations: shorter GC pauses.
+        gc.collect()
+        gc.freeze()
         log.info("gateway started", extra={"environment": settings.environment, "store": type(store).__name__})
         try:
             yield
