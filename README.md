@@ -1,110 +1,112 @@
----
-title: Self-Healing LLM Gateway
-emoji: 🛡️
-colorFrom: blue
-colorTo: purple
-sdk: gradio
-app_file: demo.py
-python_version: "3.12"
-pinned: false
-short_description: No-key LLM gateway with automatic failover.
-tags:
-  - llm
-  - fastapi
-  - observability
-  - reliability
----
-
 # Self-Healing LLM Gateway
 
 [![CI](https://github.com/osho-m/self-healing-llm-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/osho-m/self-healing-llm-gateway/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-3776AB)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Live demo](https://img.shields.io/badge/live%20demo-Hugging%20Face-orange)](https://huggingface.co/spaces/oshom/self-healing-llm-gateway)
 
-An OpenAI-compatible API gateway that sits in front of every LLM call in an organization. It:
+An OpenAI-compatible gateway that sits in front of every LLM call in an organization. It enforces per-team rate limits and dollar budgets, and keeps serving traffic when a model provider fails.
 
-- authenticates teams and restricts them to capability tiers;
-- enforces per-team **requests/min and tokens/min** with atomic Redis token buckets, keeping headroom for realtime traffic over batch traffic;
-- enforces **daily dollar budgets**, warning at 80% and blocking at 100%;
-- **retries** retryable errors with exponential backoff, opens **circuit breakers** on failing providers, and **fails over** along a per-tier fallback chain;
-- streams responses (SSE) and accounts for them in full;
-- exports **Prometheus metrics**, **OpenTelemetry traces** and structured JSON logs, with three Grafana dashboards and Slack alerting.
+**[Live demo](https://huggingface.co/spaces/oshom/self-healing-llm-gateway)** · [Benchmarks](docs/benchmarks.md) · [Real-model run](docs/real-model-run.md) · [Build plan](docs/PLAN.md) · [Security](SECURITY.md)
 
-The stack runs end to end without any cloud credentials. Deterministic mock providers make outage and failover behaviour easy to demonstrate. Real OpenAI, Anthropic and Ollama adapters are included: switching to them is a policy change, not a code change.
+![Primary outage: three retries, circuit opens, the fallback provider serves the request](docs/images/space-failover.png)
+
+## Why
+
+Teams that call several LLM providers run into the same problems:
+
+- one team's traffic starves another's;
+- a runaway job burns the monthly budget;
+- a single provider outage takes the product down.
+
+This gateway handles all three in one place. Clients send a standard chat-completions request for a capability tier (`economy`, `balanced`, `premium`), and the gateway decides which provider serves it.
+
+## Features
+
+- **Per-team limits.** Requests per minute and tokens per minute, enforced with atomic Redis token buckets. Batch traffic cannot consume the headroom reserved for realtime traffic. Limited requests get `429` with `Retry-After`.
+- **Dollar budgets.** The worst-case cost is reserved before each call and settled at the actual cost afterwards, so concurrent and streaming requests cannot overshoot the cap. Warns at 80% and blocks at 100%.
+- **Self-healing routing:**
+  - Retryable errors (429, 5xx, timeouts, connection failures) are retried with jittered exponential backoff.
+  - A per-provider circuit breaker opens after repeated failures, then admits a single half-open probe after a cooldown.
+  - Traffic moves along a per-tier fallback chain.
+  - Non-retryable errors are returned immediately and never fail over.
+- **Streaming.** SSE passthrough. Failover happens before the first byte, so clients never see a switch. Usage and cost are recorded from the assembled stream.
+- **Providers.** OpenAI-compatible APIs, the Anthropic Messages API, and Ollama. Adding a provider is a policy change, not a code change.
+- **Operations:**
+  - YAML policy with hot reload, plus runtime overrides through an admin API.
+  - Every admin change is written to an append-only audit log.
+  - Production mode refuses unsafe configuration.
+- **Observability.** Prometheus metrics, OpenTelemetry traces, structured JSON logs, three provisioned Grafana dashboards, and alert rules routed to Slack.
+
+## Results
+
+Measured, not estimated. Details and methodology are in [docs/benchmarks.md](docs/benchmarks.md).
+
+| What | Result |
+| --- | --- |
+| Gateway overhead at 100 req/s, with Redis in the request path | p99 **2.5–4.7 ms** across two CI runs (target: under 10 ms) |
+| Capacity on a shared 4-vCPU CI runner | up to **630 req/s**, zero errors |
+| Throughput optimization | **83 → 463 req/s** on the same 2-vCPU runner, after finding and replacing an HTTP-client bottleneck |
+| Real provider outage (local Ollama process killed) | Connection errors opened the circuit and the fallback served the request; the circuit closed again after the provider returned ([details](docs/real-model-run.md)) |
+| Test suite | 74 tests on Python 3.11–3.13 against real Redis, with ruff and mypy clean |
 
 ## Architecture
 
 ```text
-             ┌──────────────────────────── gateway (FastAPI) ────────────────────────────┐
-client ──▶   auth ─▶ enrichment ─▶ rate limit ─▶ budget reserve ─▶ router ─▶ settle/telemetry
- (OpenAI     (team    (system       (Redis Lua     (Redis Lua         │
-  format)     key)     prompt,       token          micro-USD         ├─ retry + backoff (retryable only)
-                       blocklist)    buckets)       ledger)           ├─ circuit breaker per provider
-                                                                      └─ tier fallback chain
-                                                                            │
-                                         ┌──────────────┬───────────────────┼──────────────┐
-                                     OpenAI API    Anthropic API        Ollama       mock providers
-   /metrics ─▶ Prometheus ─▶ Grafana (Operations / Business / Performance)
-                        └──▶ Alertmanager ─▶ Slack          OTLP traces ─▶ Jaeger
+client --> auth --> enrichment --> admission --> router --> settle + telemetry
+           (team    (system         (one atomic    |
+            key)     prompt,         Redis Lua:    +-- retry with backoff (retryable errors only)
+                     blocklist)      rate limit    +-- circuit breaker per provider
+                                     + budget)     +-- tier fallback chain
+                                                         |
+                                  OpenAI-compatible / Anthropic / Ollama / mock
+
+/metrics --> Prometheus --> Grafana (Operations, Business, Performance)
+                       \--> Alertmanager --> Slack          OTLP traces --> Jaeger
 ```
 
-| Concern | Implementation |
+| Component | Location |
 | --- | --- |
-| Provider abstraction | `app/providers/`: one normalized request/response; adapters for OpenAI-compatible APIs, Anthropic Messages, Ollama, and in-process mocks. Errors are classified as retryable (429, 5xx, timeouts, connection) or not (auth, bad request, content policy). |
-| Policy | `config/*.yml`, validated with Pydantic, **hot-reloaded** on change. Runtime overrides from the admin API take precedence and are shared through Redis (see [policy precedence](#policy-precedence)). |
-| Rate limiting | Token buckets for requests and tokens per team, in a single atomic Lua script that uses Redis server time. Batch requests must leave `batch_reserve_ratio` of each bucket for realtime requests. Returns `429` with `Retry-After`. |
-| Budgets | Before each call the worst-case cost along the tier chain is **reserved**, then settled at actual cost. Concurrent and streaming requests therefore cannot overshoot the cap. Integer micro-dollars; resets at 00:00 UTC. |
-| Resilience | Up to `max_retries` with jittered exponential backoff. A breaker opens after N failures in M seconds, and after the cooldown lets **exactly one** half-open probe through. Background health checks probe every provider, which also heals half-open circuits without user traffic. Non-retryable errors are returned immediately and never trigger fallback. |
-| Streaming | Failover happens before the first content byte, so clients never see a switch. After that, a mid-stream failure ends the stream with an error event. Usage and cost are recorded from the assembled stream. Aborted streams are charged for what was delivered. |
-| Enrichment | Per-team system prompt injection, response disclaimer, and blocked-term filter. |
-| Admin | Separate admin key (or an `admin`-role team key). Every change is written to an append-only audit log recording who changed what, and when. |
-| Observability | See [metrics](#metrics-and-alerts). Spans: request, auth, rate limit, budget, route, and one LLM call per attempt, carrying team, tier, provider, served model, tokens, cost and latency. |
+| Request pipeline, routing, streaming | `app/gateway.py` |
+| Provider adapters and error classification | `app/providers/` |
+| Rate limits, budgets, runtime overrides (Redis Lua and in-memory) | `app/stores.py` |
+| Circuit breaker, health tracking, fault injection | `app/resilience.py` |
+| Policy model, validation, hot reload | `app/policy.py` |
+| HTTP API and admin endpoints | `app/api.py` |
 
 ## Quick start
 
-### Full stack (Docker)
+### Full stack with Docker
 
 ```bash
-cp .env.example .env      # optional: admin key, Slack webhook, Grafana password, real provider keys
+cp .env.example .env
 docker compose up --build
 ```
 
 | Service | URL |
 | --- | --- |
-| Gateway / OpenAPI docs | http://localhost:8000/docs |
-| Grafana (3 dashboards, anonymous view; admin from `.env`) | http://localhost:3000 |
-| Prometheus / alerts | http://localhost:9090 |
-| Alertmanager | http://localhost:9093 |
-| Jaeger traces | http://localhost:16686 |
-| Mock providers (fault injection via `POST /fault`) | http://localhost:9001, http://localhost:9002 |
+| Gateway and OpenAPI docs | http://localhost:8000/docs |
+| Grafana | http://localhost:3000 |
+| Prometheus | http://localhost:9090 |
+| Jaeger | http://localhost:16686 |
 
-Then run the guided demo, which covers failover, circuit recovery, rate limiting, budgets and audited admin changes:
+The guided demo walks through failover, circuit recovery, rate limiting, budgets and audited admin changes:
 
-```powershell
-.\scripts\demo.ps1          # or: ./scripts/demo.sh
+```bash
+./scripts/demo.sh        # Windows: .\scripts\demo.ps1
 ```
 
-The compose policy, `config/policy.compose.yml`, sets up demo teams with different limits: `demo`, `search` (30 req/min), `compliance` (with a disclaimer), `batch` (30% realtime reserve) and `loadtest`. Edit the file while the stack is running and the gateway hot-reloads it.
-
-### Local (no Docker)
+### Local without Docker
 
 ```bash
 python -m venv .venv && . .venv/bin/activate        # Windows: .venv\Scripts\Activate.ps1
 pip install -e '.[dev]'
-GATEWAY_ADMIN_API_KEY=demo-admin-key-change-me-0000 uvicorn app.main:app_factory --factory --reload
+GATEWAY_ADMIN_API_KEY=local-admin-key-0123456789 uvicorn app.main:app_factory --factory --reload
 ```
 
-Without `GATEWAY_REDIS_URL` the gateway uses in-process stores, which is fine for a single replica in development. `GATEWAY_ENVIRONMENT=production` refuses to start without Redis, with a short or placeholder admin key, or with plaintext `api_keys` in the policy (see [SECURITY.md](SECURITY.md)).
+Without `GATEWAY_REDIS_URL`, the gateway uses in-process stores. That is fine for one replica in development; production mode requires Redis.
 
-### Hugging Face Space (no Docker, no keys)
-
-`demo.py` runs **the same gateway engine** in-process with mock providers. Hugging Face installs `requirements.txt` and starts it automatically. In the UI you can send requests, toggle a `mock-primary` outage, watch traffic fail over, and run a health probe to see the circuit close.
-
-Live at [huggingface.co/spaces/oshom/self-healing-llm-gateway](https://huggingface.co/spaces/oshom/self-healing-llm-gateway). The Space runs on either CPU basic or ZeroGPU hardware. ZeroGPU will not start a Space unless it defines a `@spaces.GPU` function, so `demo.py` defines a no-op one whenever the `spaces` package is installed. The gateway itself never uses a GPU.
-
-| Normal request (served by the tier primary) | `mock-primary` outage: 3 retries, circuit opens, fallback serves |
-| --- | --- |
-| ![Normal request served by mock-primary](docs/images/space-normal.png) | ![Outage: retries, open circuit, failover to mock-secondary](docs/images/space-failover.png) |
-
-## API
+### Send a request
 
 ```bash
 curl -X POST http://localhost:8000/v1/chat/completions \
@@ -112,200 +114,110 @@ curl -X POST http://localhost:8000/v1/chat/completions \
   -d '{"model":"balanced","messages":[{"role":"user","content":"Explain circuit breakers."}]}'
 ```
 
-`model` is a **capability tier** (`economy`, `balanced`, `premium`), not a vendor model. Optional fields: `stream`, `max_tokens`, `temperature`, and `priority` (`realtime` | `batch`). Responses are OpenAI-shaped and add an `x_gateway` block: provider, served model, fallback flag, attempts, cost, latency and budget utilization. Headers: `X-Request-ID`, `X-Gateway-Provider`, `X-RateLimit-Remaining-*`, and `X-Budget-Warning` once a team passes its warning threshold.
+Responses are OpenAI-shaped, with an extra `x_gateway` block. It reports the serving provider, served model, whether fallback was used, every attempt, cost, latency, and budget utilization.
+
+## API
 
 | Endpoint | Auth | Purpose |
 | --- | --- | --- |
-| `POST /v1/chat/completions` | team | Chat completion, SSE when `stream: true` |
+| `POST /v1/chat/completions` | team | Chat completion; SSE when `stream: true` |
 | `GET /v1/models` | team | Tiers available to the team and their fallback chains |
-| `GET /healthz`, `GET /readyz` | none | Liveness / readiness (store reachable, every tier has a non-open provider) |
-| `GET /metrics` | none (restrict at the network layer) | Prometheus |
-| `GET /v1/admin/providers` | admin | Health status, circuit, error rate, P50/P99, health history |
-| `POST /v1/admin/providers/{name}/simulate-outage?enabled=` | admin | Chaos: gateway-side outage |
-| `POST /v1/admin/providers/{name}/inject-latency?ms=` | admin | Chaos: added latency |
-| `POST /v1/admin/providers/{name}/probe` | admin | Run a health probe now |
-| `GET /v1/admin/teams`, `GET /v1/admin/teams/{id}/status` | admin | Limits, remaining buckets, spend, utilization, alert state |
+| `GET /healthz`, `GET /readyz` | none | Liveness and readiness |
+| `GET /metrics` | none | Prometheus metrics (restrict at the network layer) |
+| `GET /v1/admin/providers` | admin | Provider health, circuit state, error rate, latency, history |
+| `POST /v1/admin/providers/{name}/simulate-outage` | admin | Fault injection |
+| `GET /v1/admin/teams/{id}/status` | admin | Limits, remaining buckets, spend and utilization |
 | `PATCH /v1/admin/teams/{id}` | admin | Change limits, budget or tiers at runtime (audited) |
-| `DELETE /v1/admin/teams/{id}/overrides` | admin | Revert to the policy file |
 | `GET /v1/admin/audit` | admin | Recent admin actions |
-| `POST /v1/admin/policy/reload` | admin | Force a policy reload |
 
-Admin authentication uses `X-Admin-Key: $GATEWAY_ADMIN_API_KEY`, or the `X-API-Key` of a team whose policy `role` is `admin`. Standard team keys get `403`.
-
-Errors use the OpenAI shape `{"error": {"type", "code", "message"}}`:
+Errors follow the OpenAI shape `{"error": {"type", "code", "message"}}`:
 
 | Status | Code | Meaning |
 | --- | --- | --- |
-| 400 | `content_policy_violation` | The team blocklist or the provider rejected the content |
-| 401 / 403 | `invalid_api_key`, `tier_not_allowed`, `forbidden` | Authentication or authorization failed |
-| 429 | `rate_limit_exceeded` | Request or token bucket is empty (`Retry-After` set) |
-| 429 | `budget_exceeded` | Daily cap reached (`Retry-After` is the time until 00:00 UTC) |
-| 502 | `upstream_error` | Non-retryable provider error, such as a bad provider credential |
-| 503 | `all_providers_unavailable` | The tier's fallback chain is exhausted |
+| `400` | `content_policy_violation` | Blocked by team policy or by the provider |
+| `401`, `403` | `invalid_api_key`, `tier_not_allowed` | Authentication or authorization failed |
+| `429` | `rate_limit_exceeded`, `budget_exceeded` | Limit or daily budget reached (`Retry-After` set) |
+| `502` | `upstream_error` | Non-retryable provider error |
+| `503` | `all_providers_unavailable` | The tier's fallback chain is exhausted |
 
-## Policy precedence
+## Configuration
 
-1. Runtime overrides (`PATCH /v1/admin/teams/{id}`), stored in Redis so every replica sees them.
-2. The YAML policy file, re-read when its mtime changes. An invalid file is rejected and the last good policy stays active.
-
-Overrides survive hot reloads. After you copy a change into the YAML file, clear the override with `DELETE …/overrides` so the file stays the long-term source of truth. Store only `api_key_sha256` hashes in real policies (`python scripts/hash_key.py`). Plaintext `api_keys` exist for local demos only.
-
-### Using real providers
-
-Add a provider entry and reference it from a tier chain; keys are read from the environment variable named by `api_key_env`:
+The policy file defines providers, tier fallback chains, teams and resilience settings. It is validated on load and hot-reloaded when it changes; an invalid file is rejected and the last good policy stays active. Runtime overrides from `PATCH /v1/admin/teams/{id}` take precedence and are shared through Redis.
 
 ```yaml
 providers:
-  - { name: openai-gpt4o, kind: openai, model: gpt-4o, api_key_env: OPENAI_API_KEY,
-      input_price_per_mtok: 2.50, output_price_per_mtok: 10.00 }
-  - { name: anthropic-sonnet, kind: anthropic, model: claude-sonnet-5-5, api_key_env: ANTHROPIC_API_KEY,
-      input_price_per_mtok: 3.00, output_price_per_mtok: 15.00 }
-  - { name: ollama-local, kind: ollama, model: "llama3.2:3b", base_url: "http://host.docker.internal:11434/v1" }
+  - { name: anthropic-opus, kind: anthropic, model: claude-opus-5-5, api_key_env: ANTHROPIC_API_KEY,
+      input_price_per_mtok: 4.00, output_price_per_mtok: 20.00 }
+  - { name: openai-main, kind: openai, model: <model-id>, api_key_env: OPENAI_API_KEY,
+      input_price_per_mtok: <current list price>, output_price_per_mtok: <current list price> }
+  - { name: ollama-local, kind: ollama, model: "qwen2.5:0.5b", base_url: "http://localhost:11434/v1" }
 tiers:
-  premium: [openai-gpt4o, anthropic-sonnet, ollama-local]
+  premium: [anthropic-opus, openai-main, ollama-local]
 ```
 
-Prices are deployment configuration. Reconcile tracked spend against provider invoices.
+Prices are deployment configuration. Set them from each provider's current price list, and reconcile tracked spend against provider invoices.
 
-#### Verified with a real model (local Ollama)
+Store team keys only as `api_key_sha256` hashes; generate them with `python scripts/hash_key.py`. Production mode refuses to start in any of these cases:
 
-`config/policy.ollama.yml` puts a real local model (`qwen2.5:0.5b` on Ollama 0.40) first in the chain, with a mock behind it as the fallback. Run it on a laptop:
+- Redis is not configured;
+- the admin key is short or a documented placeholder;
+- the policy contains plaintext keys.
 
-```bash
-ollama pull qwen2.5:0.5b
-GATEWAY_POLICY_PATH=config/policy.ollama.yml uvicorn app.main:app_factory --factory
-```
+See [SECURITY.md](SECURITY.md).
 
-Observed:
+## Observability
 
-| Step | Result |
-| --- | --- |
-| Non-streaming request | Real completion from `qwen2.5:0.5b`. Token usage was taken from the provider: 42 prompt + 25 completion tokens. |
-| Streaming request | 40 SSE content chunks were relayed. Usage was recorded from the final event. |
-| **Ollama process killed** | The first request made 2 attempts; both failed with real `connection` errors ("refused the network connection"). The circuit opened and the mock fallback answered. Later requests skipped the dead provider in about 0.3 ms. |
-| Ollama restarted | After the 10 s cooldown, one half-open probe succeeded and the circuit closed. Traffic went back to the real model. |
+The gateway exposes these metrics:
 
-No cloud API keys were used. The OpenAI and Anthropic adapters are covered by contract tests against recorded response shapes (`tests/test_providers.py`), not by live calls.
+- requests, errors, retries and fallbacks;
+- latency, split into end-to-end time, provider time, gateway overhead, and Redis time;
+- tokens and cost;
+- circuit state and provider health;
+- rate-limit rejections;
+- budget utilization per team.
 
-## Metrics and alerts
+Grafana dashboards (Operations, Business, Performance) are provisioned from `deploy/grafana/dashboards`.
 
-| Metric | Labels |
-| --- | --- |
-| `gateway_requests_total` | team, tier, provider, status, priority |
-| `gateway_errors_total` | team, tier, provider, error_type |
-| `gateway_request_duration_seconds` / `gateway_provider_duration_seconds` | tier/provider |
-| `gateway_overhead_seconds` | time in the gateway excluding provider calls and backoff |
-| `gateway_tokens_total`, `gateway_cost_usd_total` | team, provider, direction |
-| `gateway_fallbacks_total`, `gateway_retries_total` | tier, from/to provider; provider, error_type |
-| `gateway_circuit_state` (0/1/2), `gateway_circuit_state_changes_total`, `gateway_provider_health` | provider |
-| `gateway_rate_limited_total` | team, limit (`requests`/`tokens`/`budget`), priority |
-| `gateway_budget_utilization_ratio`, `gateway_budget_spend_usd`, `gateway_budget_warnings_total` | team |
+Alert rules in `deploy/prometheus/alerts.yml` cover:
 
-Grafana dashboards are provisioned from `deploy/grafana/dashboards` and generated by `scripts/gen_dashboards.py`:
+- provider error rate;
+- open circuits;
+- a tier with no healthy provider;
+- budget thresholds;
+- the latency SLA;
+- gateway overhead.
 
-- **Operations**: circuit state, provider health, error rates, fallbacks, retries, limit rejections.
-- **Business**: budget utilization, spend, cost rate per team and provider, usage trends.
-- **Performance**: gateway overhead percentiles, latency P50/P95/P99 per provider, token throughput.
-
-Alert rules (`deploy/prometheus/alerts.yml`) route to Slack through Alertmanager. Set `SLACK_WEBHOOK_URL` to enable delivery. The rules are:
-
-- provider error rate above 5%
-- circuit open
-- a tier with no healthy provider
-- a team at 80% or 100% of its budget
-- P99 latency above the 5 s SLA
-- gateway P99 overhead above 10 ms (sustained for 10 minutes)
-
-## Verification
+## Testing and CI
 
 ```bash
 pip install -e '.[dev]'
-ruff check . && ruff format --check .
-pytest -q --cov=app                     # set REDIS_URL to also run the Redis store tests
+ruff check . && ruff format --check . && mypy
+pytest -q --cov=app            # set REDIS_URL to include the Redis store tests
 ```
 
-The test suite covers:
+Every pull request runs these checks:
 
-- rate limits that hold exactly under concurrency, including the batch reserve;
-- budget caps that block at the threshold;
-- retry, fallback and no-fallback on non-retryable errors;
-- circuit open, half-open and close, including recovery through a health probe;
-- streaming output that matches non-streaming output, plus failover before the first byte;
-- enrichment, admin RBAC and auditing, and policy hot reload.
+- **Lint and types:** ruff and mypy.
+- **Tests:** Python 3.11–3.13 against a real Redis instance. Redis-backed tests fail rather than skip when Redis is missing.
+- **Monitoring config:** Prometheus and Alertmanager configs are validated.
+- **Docker smoke test:** boots the full Docker Compose stack, then exercises failover against real HTTP faults from the mock provider.
+- **Load tests:** two runs, with overhead p95 gated as a regression guard.
 
-CI runs the suite on Python 3.11–3.13 against a real Redis instance; the Redis tests fail rather than skip if Redis is missing. CI also validates the Prometheus and Alertmanager configs, boots the compose stack, smoke-tests failover against real HTTP faults injected into the mock provider, and runs two load tests: a 5,000-request capacity run, and an open-loop run at 100 req/s that fails CI if overhead p95 exceeds 25 ms. That 25 ms limit is a regression guard sized for noisy shared runners.
+## Hugging Face Space
 
-## Load test
+The [live demo](https://huggingface.co/spaces/oshom/self-healing-llm-gateway) runs the same gateway engine in-process, so you can try it without Docker or API keys. You can send a request, simulate a primary-provider outage, and watch the retries, the open circuit and the fallback.
 
-```bash
-python loadtests/loadtest.py --requests 5000 --concurrency 500 [--outage]   # capacity: closed loop, mixed teams/tiers/priorities
-python loadtests/loadtest.py --requests 3000 --rate 100                     # overhead SLO: fixed arrival rate (open loop)
-k6 run loadtests/gateway.js                                                   # sustained arrival-rate profile
-```
+Each visitor gets an isolated gateway. The demo's providers are deterministic mocks, so outages and failovers are reproducible.
 
-`loadtest.py` reads two of the gateway's own histograms:
+## Roadmap
 
-- `gateway_overhead_seconds`: time in the gateway, excluding provider calls and retry backoff.
-- `gateway_store_duration_seconds`: request-path Redis calls. This is a subset of overhead.
+1. A durable usage ledger for invoicing (Postgres or ClickHouse). The Redis ledger keeps 48 hours.
+2. Circuit-breaker state shared across replicas through Redis.
+3. Admin SSO/OIDC instead of a shared admin key, and audit-log shipping to immutable storage.
+4. Idempotency keys, plus per-request deadline budgets across retries.
+5. A time-to-first-token SLO for streaming.
+6. Provider tokenizers for admission estimates instead of the 4-characters-per-token approximation.
 
-Neither figure includes provider latency.
+## License
 
-The two modes measure different things:
-
-- **Closed loop** keeps 500 requests in flight. That is more than the gateway can serve at once, so requests queue for CPU and the queueing time appears as "overhead". Use this mode for **capacity**, not for overhead.
-- **Open loop** (`--rate`) sends a fixed request rate below capacity. That is the condition the <10 ms overhead target is about.
-
-**CI.** Every PR runs the `compose-smoke` job on a GitHub-hosted runner. The full compose stack (gateway, Redis, both mocks, Jaeger) and the load generator all share one VM. The job prints the runner hardware before the load tests.
-
-*Public-repo runner: 4 vCPU, 15 GiB, Intel Xeon 6975P-C, real Redis. Two runs on identical code:*
-
-| Mode | Run | Throughput | Overhead p50 / p95 / p99 | Redis calls p50 / p95 / p99 |
-| --- | --- | --- | --- | --- |
-| Capacity: closed loop, 500 in flight, 5,000 requests | 1 | 408 req/s | 75 / 192 / 330 ms (queueing) | 33 / 83 / 173 ms |
-| | 2 | **630 req/s** | 48 / 99 / 211 ms (queueing) | 25 / 53 / 93 ms |
-| Overhead SLO: open loop at 100 req/s, 3,000 requests | 1 | 100 req/s | 1.77 / 2.98 / **4.73 ms** | 0.26 / 0.57 / 1.13 ms |
-| | 2 | 100 req/s | 1.63 / 2.42 / **2.49 ms** | 0.26 / 0.49 / 0.90 ms |
-
-Both runs had zero errors. The 429 responses come from the `search` team's 30 req/min limit, which the test hits on purpose.
-
-**The <10 ms gateway-overhead target holds at p99 with Redis in the request path on the 4-vCPU runner.** Redis round trips account for about 1 ms of that.
-
-On the earlier 2-vCPU private-repo runner, the same code gave p95 3.9–12.1 ms and p99 7.7–24.5 ms. That runner had too little CPU for six processes, so the tail was scheduling noise. CI therefore gates p95 at 25 ms, as a regression guard against those noisy runners.
-
-Throughput in closed-loop mode is bounded by the shared VM, which also runs the load generator and mocks. It is a lower bound, not the gateway's ceiling. To scale further, add gateway replicas: all limit and budget state lives in Redis.
-
-All values are interpolated within histogram buckets.
-
-**Local.** Windows 11 laptop with the in-memory store, so there are no Redis round trips:
-
-| Mode | Throughput | Overhead p50 / p95 / p99 |
-| --- | --- | --- |
-| Capacity, 300 in flight | 570 req/s | 0.28 / 0.80 / 0.98 ms |
-| Open loop at 200 req/s | 200 req/s | 0.72 / 1.73 / 2.35 ms |
-| Capacity, 500 in flight, primary outage halfway through | 388 req/s | 0.72 / 2.13 / 2.49 ms; 2,287 requests served by the fallback, zero 5xx |
-
-**How throughput went from 83 to 630 req/s in CI** (83 and 463 on the 2-vCPU runner, 630 on the 4-vCPU one):
-
-1. **httpx was the bottleneck.** Against the same mock provider, httpx fell from 204 to 89 req/s as concurrency rose from 10 to 200, while aiohttp reached 3,346 req/s. The gateway now calls providers through aiohttp (`app/http.py`).
-2. **Admission is one Redis round trip.** Rate limiting and budget reservation run in a single Lua script.
-3. **Lighter middleware.** A pure ASGI middleware replaced Starlette's `BaseHTTPMiddleware`.
-4. **Trace sampling.** Head-based sampling uses `GATEWAY_OTEL_SAMPLE_RATIO`, set to 0.1 in compose. Span export holds the GIL in a background thread.
-
-`gc.freeze()` also runs after startup.
-
-To scale further, run more gateway replicas: Redis already holds all shared limit and budget state.
-
-## Production notes and backlog
-
-Done: Redis-backed atomic limits and ledger, provider adapters with timeouts, admin RBAC and an audit log, OpenTelemetry traces, alert rules, load tests, CI.
-
-Still open:
-
-1. Durable usage ledger for invoicing (Postgres or ClickHouse). The Redis ledger keeps 48 hours.
-2. Circuit-breaker and health state live in each replica. Share breaker state through Redis if replicas must agree immediately.
-3. Admin SSO/OIDC in place of a shared admin key; audit log shipping to immutable storage.
-4. Idempotency keys and per-request deadline budgets across retries.
-5. `LatencyP99AboveSLA` uses end-to-end duration, which includes long streamed generations; add a time-to-first-token SLO for streams.
-6. Response caching tier, and token counting with provider tokenizers instead of the 4-chars-per-token admission estimate.
-
-See [docs/PLAN.md](docs/PLAN.md) for the build plan and [SECURITY.md](SECURITY.md) for the security model.
+[MIT](LICENSE)
