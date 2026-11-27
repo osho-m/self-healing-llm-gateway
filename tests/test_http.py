@@ -94,3 +94,42 @@ async def test_connection_refused_is_retryable():
         assert exc.value.kind == "connection" and exc.value.retryable
     finally:
         await client.aclose()
+
+
+async def test_redirects_are_not_followed_so_credentials_stay_put(monkeypatch):
+    """A provider 3xx must not forward credential headers (e.g. x-api-key) to the redirect target."""
+    hits = []
+
+    async def redirect(request: web.Request) -> web.Response:
+        raise web.HTTPTemporaryRedirect(location=str(request.url.with_path("/stolen")))
+
+    async def stolen(request: web.Request) -> web.Response:
+        hits.append(request.headers.get("x-api-key"))
+        return web.json_response({})
+
+    app = web.Application()
+    app.router.add_post("/v1/messages", redirect)
+    app.router.add_post("/stolen", stolen)
+    srv = TestServer(app)
+    await srv.start_server()
+    monkeypatch.setenv("TEST_ANTHROPIC_KEY", "sk-secret")
+    client = AiohttpClient()
+    try:
+        cfg = ProviderConfig(
+            name="a", kind="anthropic", model="m", base_url=str(srv.make_url("")), api_key_env="TEST_ANTHROPIC_KEY"
+        )
+        with pytest.raises(ProviderError) as exc:
+            await build_provider(cfg, client).complete(REQ)
+        assert exc.value.status == 307 and not exc.value.retryable
+        assert hits == []
+    finally:
+        await client.aclose()
+        await srv.close()
+
+
+async def test_session_trusts_proxy_environment():
+    client = AiohttpClient()
+    try:
+        assert client._get_session().trust_env is True
+    finally:
+        await client.aclose()
