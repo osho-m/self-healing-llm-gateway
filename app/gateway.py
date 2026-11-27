@@ -24,6 +24,7 @@ from app.schemas import ChatMessage, ChatRequest, ChatResponse, Choice, GatewayM
 from app.stores import Store, seconds_until_utc_midnight
 
 log = logging.getLogger(__name__)
+_BACKGROUND_TASKS: set[asyncio.Task] = set()  # strong refs so close tasks are not GC'd mid-flight
 
 
 @dataclass
@@ -72,7 +73,16 @@ class Gateway:
             return
         res = self.policy.resilience
         for cfg in self.policy.providers:
-            self.providers[cfg.name] = build_provider(cfg, self.client)
+            old = self.providers.get(cfg.name)
+            if old is None or old.config != cfg:
+                self.providers[cfg.name] = build_provider(cfg, self.client)
+                if old is not None:
+                    self._close_later(old)
+            if not cfg.is_configured():
+                log.warning(
+                    "provider not configured; it will be skipped",
+                    extra={"provider": cfg.name, "missing_env": cfg.api_key_env},
+                )
             if cfg.name in self.breakers:
                 self.breakers[cfg.name].configure(
                     res.circuit_failure_threshold, res.circuit_window_s, res.circuit_cooldown_s
@@ -90,8 +100,21 @@ class Gateway:
             tracker.window_s = res.health_window_s
             self._set_health_gauge(cfg.name, tracker.status)
         for gone in set(self.providers) - {p.name for p in self.policy.providers}:
-            self.providers.pop(gone, None)
+            self._close_later(self.providers.pop(gone))
         self._policy_version = self.policy_manager.version
+
+    @staticmethod
+    def _close_later(provider: Provider) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # no running loop (startup or tests); nothing to schedule on
+            return
+        task = loop.create_task(provider.aclose())
+        _BACKGROUND_TASKS.add(task)
+        task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+    def _configured(self, name: str) -> bool:
+        return self.policy.provider(name).is_configured()
 
     async def refresh_policy(self) -> None:
         self.policy_manager.reload_if_changed()
@@ -216,6 +239,9 @@ class Gateway:
         res, tier = self.policy.resilience, adm.req.model
         chain = self.policy.tiers[tier]
         for idx, name in enumerate(chain):
+            if not self._configured(name):
+                adm.attempts.append(f"{name}: not configured")
+                continue
             breaker = self.breakers[name]
             if not breaker.allow():
                 adm.attempts.append(f"{name}: circuit {breaker.state}")
@@ -373,6 +399,9 @@ class Gateway:
         res, tier = self.policy.resilience, adm.req.model
         chain = self.policy.tiers[tier]
         for idx, name in enumerate(chain):
+            if not self._configured(name):
+                adm.attempts.append(f"{name}: not configured")
+                continue
             breaker = self.breakers[name]
             if not breaker.allow():
                 adm.attempts.append(f"{name}: circuit {breaker.state}")
@@ -504,9 +533,12 @@ class Gateway:
     # ------------------------------------------------------------------ health checks
 
     async def probe_all(self) -> None:
-        await asyncio.gather(*(self.probe(name) for name in list(self.providers)), return_exceptions=True)
+        names = [n for n, p in self.providers.items() if p.config.probe and p.config.is_configured()]
+        await asyncio.gather(*(self.probe(name) for name in names), return_exceptions=True)
 
     async def probe(self, name: str) -> None:
+        if not self._configured(name):
+            return
         breaker = self.breakers[name]
         half_open = breaker.current_state() == HALF_OPEN
         if half_open and not breaker.allow():
@@ -541,7 +573,8 @@ class Gateway:
             out[name] = {
                 "kind": cfg.kind,
                 "model": cfg.model,
-                "status": status,
+                "configured": cfg.is_configured(),
+                "status": status if cfg.is_configured() else "not_configured",
                 "circuit": self.breakers[name].current_state(),
                 **tracker.stats(),
                 "last_error": tracker.last_error,
@@ -553,5 +586,6 @@ class Gateway:
         return out
 
     async def aclose(self) -> None:
+        await asyncio.gather(*(p.aclose() for p in self.providers.values()), return_exceptions=True)
         await self.client.aclose()
         await self.store.close()

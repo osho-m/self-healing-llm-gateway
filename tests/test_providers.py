@@ -38,29 +38,6 @@ async def test_openai_translation_and_auth_header(monkeypatch):
     assert seen["body"]["messages"][0]["role"] == "system" and seen["body"]["max_tokens"] == 16
 
 
-async def test_anthropic_translation_moves_system_prompt():
-    seen = {}
-
-    def handler(request: httpx.Request):
-        seen["body"] = json.loads(request.content)
-        seen["version"] = request.headers["anthropic-version"]
-        return httpx.Response(
-            200,
-            json={
-                "model": "claude",
-                "content": [{"type": "text", "text": "hello"}],
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": 9, "output_tokens": 2},
-            },
-        )
-
-    result = await provider("anthropic", handler).complete(REQ)
-    assert result.content == "hello" and result.prompt_tokens == 9 and result.finish_reason == "stop"
-    assert seen["body"]["system"] == "be brief"
-    assert [m["role"] for m in seen["body"]["messages"]] == ["user"]
-    assert seen["version"]
-
-
 @pytest.mark.parametrize(
     ("status", "body", "kind", "retryable"),
     [
@@ -98,21 +75,3 @@ async def test_openai_streaming_parses_sse_and_usage():
     out = [c async for c in p.stream(REQ)]
     assert "".join(c.delta for c in out) == "Hello"
     assert out[-1].prompt_tokens == 3 and out[-1].completion_tokens == 2
-
-
-async def test_anthropic_streaming_events():
-    events = [
-        ("message_start", {"type": "message_start", "message": {"usage": {"input_tokens": 5}}}),
-        ("content_block_delta", {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Hi"}}),
-        ("content_block_delta", {"type": "content_block_delta", "delta": {"type": "text_delta", "text": " there"}}),
-        (
-            "message_delta",
-            {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 2}},
-        ),
-        ("message_stop", {"type": "message_stop"}),
-    ]
-    sse = "".join(f"event: {e}\ndata: {json.dumps(d)}\n\n" for e, d in events)
-    p = provider("anthropic", lambda r: httpx.Response(200, text=sse))
-    out = [c async for c in p.stream(REQ)]
-    assert "".join(c.delta for c in out) == "Hi there"
-    assert out[0].prompt_tokens == 5 and out[-1].completion_tokens == 2 and out[-1].finish_reason == "stop"

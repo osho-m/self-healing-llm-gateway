@@ -72,9 +72,20 @@ class ProviderConfig(BaseModel):
     output_price_per_mtok: float = Field(default=0.0, ge=0)
     # Mock-only tuning
     mock_latency_ms: float = 0.0
+    # Anthropic only: reasoning effort, and a floor for max_tokens. Current Claude models always
+    # think and thinking tokens count against max_tokens, so tiny caps can leave no room for the answer.
+    effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
+    min_max_tokens: int = Field(default=0, ge=0)
+    # Background health probes send a real request every interval. Turn them off for paid providers;
+    # an open circuit then recovers through the single half-open live request after the cooldown.
+    probe: bool = True
 
     def api_key(self) -> str | None:
         return os.environ.get(self.api_key_env) if self.api_key_env else None
+
+    def is_configured(self) -> bool:
+        """False when the provider needs an API key that is not set (it is then skipped, not called)."""
+        return self.api_key_env is None or bool(self.api_key())
 
     def cost_usd(self, prompt_tokens: int, completion_tokens: int) -> float:
         return (prompt_tokens * self.input_price_per_mtok + completion_tokens * self.output_price_per_mtok) / 1e6

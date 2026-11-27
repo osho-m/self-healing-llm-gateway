@@ -92,6 +92,10 @@ class Provider(ABC):
     @abstractmethod
     def stream(self, request: CompletionRequest) -> AsyncIterator[StreamChunk]: ...
 
+    async def aclose(self) -> None:
+        """Release provider-owned resources (SDK clients). Shared HTTP clients are closed by the gateway."""
+        return None
+
     async def probe(self) -> None:
         """Cheap liveness probe used by the health monitor."""
         await self.complete(CompletionRequest(messages=[{"role": "user", "content": "ping"}], max_tokens=1))

@@ -1,11 +1,22 @@
-"""Anthropic Messages API adapter."""
+"""Anthropic Messages API adapter, built on the official ``anthropic`` SDK.
+
+The gateway owns retries, backoff and circuit breaking, so the SDK client runs with
+``max_retries=0``: SDK retries stacked inside the gateway's would multiply attempts and skew the
+breaker. The SDK's aiohttp backend is used for the same reason the rest of the gateway uses
+aiohttp: httpx-based clients degrade under high concurrency.
+
+Sampling parameters (``temperature``) are not forwarded: current Claude models reject them.
+Refusals (``stop_reason == "refusal"``) surface as non-retryable content-policy errors rather than
+empty successes. Server-side model fallbacks are not enabled; the gateway's tier chain decides
+where a request goes next, and keeps cost accounting per provider.
+"""
 
 from __future__ import annotations
 
-import json
 from collections.abc import AsyncIterator
+from typing import Any
 
-import httpx
+import anthropic
 
 from app.providers.base import (
     CompletionRequest,
@@ -13,105 +24,102 @@ from app.providers.base import (
     Provider,
     ProviderError,
     StreamChunk,
-    error_from_exception,
     error_from_status,
-    iter_sse,
 )
 
-ANTHROPIC_VERSION = "2023-06-01"
+_FINISH = {"end_turn": "stop", "stop_sequence": "stop", "max_tokens": "length", "tool_use": "tool_calls"}
 
 
 class AnthropicProvider(Provider):
-    default_base_url = "https://api.anthropic.com"
+    _sdk: anthropic.AsyncAnthropic | None = None
 
-    def _url(self) -> str:
-        return (self.config.base_url or self.default_base_url).rstrip("/") + "/v1/messages"
+    def _client(self) -> anthropic.AsyncAnthropic:
+        # Created lazily inside the running event loop (the aiohttp session needs one).
+        if self._sdk is None:
+            key = self.config.api_key()
+            if not key:
+                raise ProviderError(
+                    self.name, "auth", f"{self.config.api_key_env or 'API key'} is not set", retryable=False
+                )
+            self._sdk = anthropic.AsyncAnthropic(
+                api_key=key,
+                base_url=self.config.base_url or None,
+                max_retries=0,
+                timeout=self.config.timeout_s,
+                http_client=anthropic.DefaultAioHttpClient(),
+            )
+        return self._sdk
 
-    def _headers(self) -> dict[str, str]:
-        headers = {"anthropic-version": ANTHROPIC_VERSION}
-        key = self.config.api_key()
-        if key:
-            headers["x-api-key"] = key
-        return headers
-
-    def _payload(self, request: CompletionRequest, stream: bool) -> dict:
+    def _params(self, request: CompletionRequest) -> dict[str, Any]:
         system = "\n\n".join(m["content"] for m in request.messages if m["role"] == "system")
         messages = [
             {"role": m["role"] if m["role"] in ("user", "assistant") else "user", "content": m["content"]}
             for m in request.messages
             if m["role"] != "system"
         ]
-        body: dict = {"model": self.config.model, "max_tokens": request.max_tokens, "messages": messages}
+        params: dict[str, Any] = {
+            "model": self.config.model,
+            "max_tokens": max(request.max_tokens, self.config.min_max_tokens),
+            "messages": messages,
+        }
         if system:
-            body["system"] = system
-        if request.temperature is not None:
-            body["temperature"] = min(request.temperature, 1.0)
-        if stream:
-            body["stream"] = True
-        return body
+            params["system"] = system
+        if self.config.effort:
+            params["output_config"] = {"effort": self.config.effort}
+        return params
+
+    def _error(self, exc: Exception) -> ProviderError:
+        # Most specific first. APITimeoutError subclasses APIConnectionError.
+        if isinstance(exc, anthropic.APITimeoutError):
+            return ProviderError(self.name, "timeout", str(exc) or "timeout", retryable=True)
+        if isinstance(exc, anthropic.APIConnectionError):
+            return ProviderError(self.name, "connection", str(exc) or "connection error", retryable=True)
+        if isinstance(exc, anthropic.APIStatusError):
+            return error_from_status(self.name, exc.status_code, str(exc.message))
+        return ProviderError(self.name, "unknown", repr(exc), retryable=False)
+
+    def _refusal(self, details: Any) -> ProviderError:
+        category = getattr(details, "category", None) or "unspecified"
+        return ProviderError(self.name, "content_policy", f"model refused (category: {category})", retryable=False)
 
     async def complete(self, request: CompletionRequest) -> CompletionResult:
-        assert self.client is not None
         try:
-            resp = await self.client.post(
-                self._url(), json=self._payload(request, False), headers=self._headers(), timeout=self.config.timeout_s
-            )
-            if not 200 <= resp.status_code < 300:
-                raise error_from_status(self.name, resp.status_code, resp.text)
-            data = resp.json()
-            text = "".join(block.get("text", "") for block in data.get("content", []) if block.get("type") == "text")
-            usage = data.get("usage") or {}
-            return CompletionResult(
-                content=text,
-                prompt_tokens=int(usage.get("input_tokens", 0)),
-                completion_tokens=int(usage.get("output_tokens", 0)),
-                model=data.get("model", self.config.model),
-                finish_reason=_finish(data.get("stop_reason")),
-            )
-        except ProviderError:
-            raise
-        except Exception as exc:
-            raise error_from_exception(self.name, exc) from exc
+            message = await self._client().messages.create(**self._params(request))
+        except anthropic.AnthropicError as exc:
+            raise self._error(exc) from exc
+        if message.stop_reason == "refusal":
+            raise self._refusal(message.stop_details)
+        text = "".join(block.text for block in message.content if block.type == "text")
+        return CompletionResult(
+            content=text,
+            prompt_tokens=message.usage.input_tokens,
+            completion_tokens=message.usage.output_tokens,
+            model=message.model,
+            finish_reason=_FINISH.get(message.stop_reason or "", message.stop_reason or "stop"),
+        )
 
     async def stream(self, request: CompletionRequest) -> AsyncIterator[StreamChunk]:
-        assert self.client is not None
         try:
-            async with self.client.stream(
-                "POST",
-                self._url(),
-                json=self._payload(request, True),
-                headers=self._headers(),
-                timeout=self.config.timeout_s,
-            ) as resp:
-                if not 200 <= resp.status_code < 300:
-                    # Classify redirects by status alone: never wait on a (possibly stalled) body.
-                    redirect = 300 <= resp.status_code < 400
-                    body = "" if redirect else (await resp.aread()).decode(errors="replace")
-                    raise error_from_status(self.name, resp.status_code, body)
-                async for event, data in iter_sse(resp):
-                    obj = json.loads(data)
-                    etype = obj.get("type", event)
-                    if etype == "message_start":
-                        usage = obj.get("message", {}).get("usage", {})
-                        yield StreamChunk(prompt_tokens=usage.get("input_tokens"))
-                    elif etype == "content_block_delta":
-                        yield StreamChunk(delta=obj.get("delta", {}).get("text", ""))
-                    elif etype == "message_delta":
+            async with self._client().messages.stream(**self._params(request)) as stream:
+                async for event in stream:
+                    if event.type == "message_start":
+                        yield StreamChunk(prompt_tokens=event.message.usage.input_tokens)
+                    elif event.type == "content_block_delta" and event.delta.type == "text_delta":
+                        yield StreamChunk(delta=event.delta.text)
+                    elif event.type == "message_delta":
+                        if event.delta.stop_reason == "refusal":
+                            raise self._refusal(getattr(event.delta, "stop_details", None))
+                        reason = event.delta.stop_reason or ""
                         yield StreamChunk(
-                            completion_tokens=obj.get("usage", {}).get("output_tokens"),
-                            finish_reason=_finish(obj.get("delta", {}).get("stop_reason")),
-                        )
-                    elif etype == "error":
-                        err = obj.get("error", {})
-                        retryable = err.get("type") in ("overloaded_error", "api_error", "rate_limit_error")
-                        raise ProviderError(
-                            self.name, err.get("type", "error"), err.get("message", ""), retryable=retryable
+                            completion_tokens=event.usage.output_tokens,
+                            finish_reason=_FINISH.get(reason, reason or "stop"),
                         )
         except ProviderError:
             raise
-        except (httpx.HTTPError, ValueError, KeyError) as exc:
-            raise error_from_exception(self.name, exc) from exc
+        except anthropic.AnthropicError as exc:
+            raise self._error(exc) from exc
 
-
-def _finish(reason: str | None) -> str:
-    return {"end_turn": "stop", "max_tokens": "length", "stop_sequence": "stop"}.get(reason or "", reason or "stop")
+    async def aclose(self) -> None:
+        if self._sdk is not None:
+            await self._sdk.close()
+            self._sdk = None
