@@ -53,7 +53,7 @@ if spaces is not None:
             continue
         _loaded[cfg.model] = (tokenizer, model)
 
-    @spaces.GPU(duration=30)
+    @spaces.GPU(duration=20)  # seconds of GPU reserved per call; counts against the visitor's quota
     def _run(model_id: str, messages: list[dict[str, str]], max_tokens: int) -> LocalGeneration:
         tokenizer, model = _loaded[model_id]
         inputs = tokenizer.apply_chat_template(
@@ -102,7 +102,7 @@ def gateway_for(request: gr.Request | None) -> Gateway:
 def health(gateway: Gateway) -> dict:
     report = gateway.health_report()
     return {
-        name: {k: info[k] for k in ("status", "circuit", "error_rate", "p99_ms", "simulated_outage")}
+        name: {k: info[k] for k in ("status", "circuit", "error_rate", "p99_ms", "simulated_outage", "last_error")}
         for name, info in report.items()
     }
 
