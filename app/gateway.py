@@ -119,7 +119,8 @@ class Gateway:
         task.add_done_callback(_BACKGROUND_TASKS.discard)
 
     def _configured(self, name: str) -> bool:
-        return self.policy.provider(name).is_configured()
+        provider = self.providers.get(name)
+        return self.policy.provider(name).is_configured() and provider is not None and provider.is_available()
 
     async def refresh_policy(self) -> None:
         self.policy_manager.reload_if_changed()
@@ -608,7 +609,7 @@ class Gateway:
     # ------------------------------------------------------------------ health checks
 
     async def probe_all(self) -> None:
-        names = [n for n, p in self.providers.items() if p.config.probe and p.config.is_configured()]
+        names = [n for n, p in self.providers.items() if p.config.probe and self._configured(n)]
         await asyncio.gather(*(self.probe(name) for name in names), return_exceptions=True)
 
     async def probe(self, name: str) -> None:
@@ -648,8 +649,8 @@ class Gateway:
             out[name] = {
                 "kind": cfg.kind,
                 "model": cfg.model,
-                "configured": cfg.is_configured(),
-                "status": status if cfg.is_configured() else "not_configured",
+                "configured": self._configured(name),
+                "status": status if self._configured(name) else "not_configured",
                 "circuit": self.breakers[name].current_state(),
                 **tracker.stats(),
                 "last_error": tracker.last_error,
