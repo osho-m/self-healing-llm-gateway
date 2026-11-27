@@ -1,26 +1,29 @@
-# Security policy
+# Security
 
-## Reporting
+## Reporting a problem
 
-Report suspected vulnerabilities privately to the repository owner. Do not open a public issue containing exploit details.
+Report a suspected vulnerability privately to the repository owner. Please do not open a public issue with exploit details.
 
-## Model
+## How the gateway protects itself
 
-- **Team keys** are stored only as SHA-256 hashes (`api_key_sha256`); generate them with `python scripts/hash_key.py`. The plaintext `api_keys` field exists for local demos and must not be used for real keys.
-- **Admin routes** require a separate `GATEWAY_ADMIN_API_KEY` (compared in constant time) or a team key whose policy `role` is `admin`. Standard team keys receive `403`. Every admin action is written to an append-only audit log.
-- **Production mode** (`GATEWAY_ENVIRONMENT=production`) refuses to start without Redis, without an admin key of at least 24 characters, or with an admin key that looks like a documented placeholder (`demo`, `example`, `change-me`). It also rejects policy files that contain plaintext `api_keys`, both at startup and on hot reload, so only `api_key_sha256` hashes are accepted.
-- **Provider credentials** are read from environment variables named in the policy (`api_key_env`) and are never logged or returned.
-- **Fault-injection endpoints** are admin-only on the gateway. The mock provider's `/fault` endpoint has no authentication and must never be exposed outside a test network.
-- `/metrics` is unauthenticated, following Prometheus convention. Restrict it at the network layer.
+- **Team keys** are stored only as SHA-256 hashes (`api_key_sha256`). Create one with `python scripts/hash_key.py`. The plain-text `api_keys` field exists only for local demos; never use it for real keys.
+- **Admin routes** need either the separate `GATEWAY_ADMIN_API_KEY` (checked in constant time, so its length and content can't be guessed from timing) or a team key whose policy `role` is `admin`. Ordinary team keys get `403`. Every admin action goes into an append-only audit log.
+- **Production mode** (`GATEWAY_ENVIRONMENT=production`) refuses to start if:
+  - Redis is not configured;
+  - the admin key is shorter than 24 characters, or looks like a documented placeholder (`demo`, `example`, `change-me`);
+  - the policy file contains plain-text `api_keys`. This is checked at startup and on every reload, so only hashes are ever accepted.
+- **Model API keys** are read from the environment variables named in the policy (`api_key_env`). They are never logged or returned.
+- **Fault injection** on the gateway is admin-only. The mock model's `/fault` endpoint has no login at all, so keep it inside a test network.
+- **`/metrics`** has no login, as is usual for Prometheus. Restrict it at the network level.
 
-## Do not commit
+## Never commit
 
-Provider keys, team API keys, `.env` files, or customer prompts. `.gitignore` excludes `.env` and `data/` (audit logs).
+Model API keys, team keys, `.env` files or customer prompts. `.gitignore` already excludes `.env` and `data/` (where audit logs go).
 
-## Before production
+## Before going to production
 
-- Put admin access behind SSO/OIDC.
-- Store secrets in a managed secret store.
-- Terminate TLS in front of the gateway.
-- Ship audit logs to immutable storage.
-- Rotate the default demo keys in `config/*.yml`, or remove them.
+- Put admin access behind single sign-on.
+- Keep secrets in a managed secret store.
+- Serve the gateway over TLS.
+- Ship audit logs to storage that cannot be edited.
+- Change or remove the demo keys in `config/*.yml`.

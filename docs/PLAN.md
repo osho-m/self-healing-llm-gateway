@@ -1,15 +1,15 @@
-# Build plan: production LLM gateway
+# Build plan
 
 ## Goal
 
-Make the repository deliver what its README described. The starting point was a Gradio-only demo (`demo.py` and `space_gateway.py`), while the README referenced a FastAPI `app/`, tests, Docker Compose, k6 and Grafana, none of which existed.
+The repository started as a Gradio demo (`demo.py` and `space_gateway.py`), while its README described a FastAPI service with tests, Docker Compose, k6 and Grafana that did not exist. The goal was to build what the README promised.
 
-The specification is *Project 11: LLM Gateway with Rate Limiting, Fallback Routing, and Observability*. Done means two things:
+The specification is *Project 11: LLM Gateway with Rate Limiting, Fallback Routing, and Observability*. The work counts as done when:
 
 - every command in the README works;
-- every phase of the specification is either built and tested, or listed explicitly in the backlog.
+- every part of the specification is either built and tested, or listed in the roadmap.
 
-## Acceptance criteria → where it lives
+## Each requirement, where it is built and how it is tested
 
 | # | Spec requirement | Implementation | Verified by |
 | --- | --- | --- | --- |
@@ -34,22 +34,24 @@ The specification is *Project 11: LLM Gateway with Rate Limiting, Fallback Routi
 | 5.3 | Compose: gateway, Redis, Prometheus, Grafana, mock providers, demo teams | `docker-compose.yml`, `config/policy.compose.yml` | CI `compose-smoke` |
 | 6 | Demo script and narrative | `scripts/demo.ps1`, `scripts/demo.sh`, README | manual |
 
-## Phases (thin, tested slices)
+## Order of work
 
-1. Scaffolding: `pyproject.toml`, settings, policy model with hot reload and overrides.
-2. Providers and error classification; mock provider HTTP service.
-3. Stores: Redis Lua token buckets and budget ledger, with an in-memory equivalent.
-4. Router: retries, circuit breakers, fallback chains; streaming.
-5. Admin API, audit log, health monitor; metrics, traces, logs.
-6. Ops: Dockerfile, compose, Prometheus, Alertmanager, Grafana, Jaeger; demo scripts; load tests.
-7. CI: lint, tests against Redis, config validation, compose smoke test and load test.
-8. Docs: README reflects what exists; the backlog lists what does not.
+Each step was small and tested before the next one started.
 
-## Key decisions
+1. Project setup: `pyproject.toml`, settings, and the policy file with hot reload and runtime overrides.
+2. Model adapters and error handling, plus a mock model server.
+3. Counters: Redis Lua scripts for rate limits and budgets, with an in-memory version for development.
+4. Router: retries, circuit breakers, fallback order and streaming.
+5. Admin API, audit log, health checks, metrics, traces and logs.
+6. Operations: Dockerfile, Docker Compose, Prometheus, Alertmanager, Grafana, Jaeger, demo scripts and load tests.
+7. CI: lint, tests against Redis, config checks, a Docker test and a load test.
+8. Docs: the README describes only what exists; the roadmap lists the rest.
 
-- **Tier, not vendor, in `model`.** Fallback chains are defined per tier, so callers never depend on a specific vendor.
-- **Reserve then settle for budgets.** This prevents concurrent and streaming requests from overspending; a check made only after the call cannot.
-- **Gateway-side fault injection and mock-side faults.** The first gives demos deterministic outages. The second (`POST /fault` on the mock provider) exercises the real HTTP error path in CI.
-- **Breaker state stays per replica.** It is cheap and fast. If replicas must agree immediately, sharing it through Redis is listed in the backlog.
-- **The Space reuses the production engine.** `demo.py` imports `app.gateway`, so the demo cannot drift from the shipped code.
-- **Open-source models by default.** Every shipped setup runs SmolLM2, Qwen2.5 and Phi-3.5. Paid APIs are optional and switch on only when their key is set.
+## Main decisions
+
+- **Apps ask for a tier, not a model.** Each tier has its own fallback order, so apps never depend on one vendor.
+- **Budgets are reserved first and settled after.** Checking only after a call cannot stop parallel or streaming requests from overspending.
+- **Two kinds of fake outage.** The gateway can fake an outage for demos, and the mock model server can return real HTTP errors (`POST /fault`) so CI tests the real error path.
+- **Each gateway copy keeps its own circuit state.** This is cheap and fast. Sharing it through Redis is on the roadmap for when copies must agree right away.
+- **The demo runs the real gateway code.** `demo.py` imports `app.gateway`, so the demo can never drift from what ships.
+- **Open-source models by default.** Every shipped setup runs SmolLM2, Qwen2.5 and Phi-3.5. Paid APIs are optional and turn on only when their key is set.

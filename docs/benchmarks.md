@@ -1,63 +1,68 @@
 # Benchmarks
 
-How the gateway was load-tested and what was measured. Summary numbers are in the [README](../README.md#results).
+How the gateway was load-tested and what came out. The headline numbers are in the [README](../README.md#results).
 
 ## How to run
 
 ```bash
-python loadtests/loadtest.py --requests 5000 --concurrency 500 [--outage]   # capacity: closed loop, mixed teams/tiers/priorities
-python loadtests/loadtest.py --requests 3000 --rate 100                     # overhead SLO: fixed arrival rate (open loop)
-k6 run loadtests/gateway.js                                                   # sustained arrival-rate profile
+python loadtests/loadtest.py --requests 5000 --concurrency 500 [--outage]   # capacity: keeps 500 requests in flight
+python loadtests/loadtest.py --requests 3000 --rate 100                     # overhead: a steady 100 requests per second
+k6 run loadtests/gateway.js                                                   # a sustained load profile
 ```
 
-`loadtest.py` reads two of the gateway's own histograms:
+`loadtest.py` reads two timers that the gateway records itself:
 
-- `gateway_overhead_seconds`: time in the gateway, excluding provider calls and retry backoff.
-- `gateway_store_duration_seconds`: request-path Redis calls. This is a subset of overhead.
+- `gateway_overhead_seconds`: the time a request spends inside the gateway. It leaves out the model's own time and any retry waits.
+- `gateway_store_duration_seconds`: the time spent talking to Redis. This is part of the overhead.
 
-Neither figure includes provider latency.
+Neither number includes the time the model takes to answer.
 
-The two modes measure different things:
+## Two kinds of test
 
-- **Closed loop** keeps 500 requests in flight. That is more than the gateway can serve at once, so requests queue for CPU and the queueing time appears as "overhead". Use this mode for **capacity**, not for overhead.
-- **Open loop** (`--rate`) sends a fixed request rate below capacity. That is the condition the <10 ms overhead target is about.
+**Capacity** keeps 500 requests in flight at once. That is more than the gateway can work on at the same moment, so requests wait in line for the CPU, and that waiting shows up as "overhead". Use this test to find the most requests per second the setup can handle, not to judge overhead.
 
-**CI.** Every PR runs the `compose-smoke` job on a GitHub-hosted runner. The full compose stack (gateway, Redis, both mocks, Jaeger) and the load generator all share one VM. The job prints the runner hardware before the load tests.
+**Overhead** sends a steady 100 requests per second, below capacity. This is the situation the "under 10 ms" target is about.
 
-*Public-repo runner: 4 vCPU, 15 GiB, Intel Xeon 6975P-C, real Redis. Two runs on identical code:*
+## Results in CI
 
-| Mode | Run | Throughput | Overhead p50 / p95 / p99 | Redis calls p50 / p95 / p99 |
+Every pull request runs the `compose-smoke` job on a GitHub runner. The whole stack (gateway, Redis, two mock models, Jaeger) and the load generator share one machine. The job prints the machine's hardware before the tests.
+
+Machine: 4 vCPU, 15 GiB, Intel Xeon 6975P-C, real Redis. Two runs of the same code:
+
+| Test | Run | Requests per second | Overhead p50 / p95 / p99 | Redis time p50 / p95 / p99 |
 | --- | --- | --- | --- | --- |
-| Capacity: closed loop, 500 in flight, 5,000 requests | 1 | 408 req/s | 75 / 192 / 330 ms (queueing) | 33 / 83 / 173 ms |
-| | 2 | **630 req/s** | 48 / 99 / 211 ms (queueing) | 25 / 53 / 93 ms |
-| Overhead SLO: open loop at 100 req/s, 3,000 requests | 1 | 100 req/s | 1.77 / 2.98 / **4.73 ms** | 0.26 / 0.57 / 1.13 ms |
-| | 2 | 100 req/s | 1.63 / 2.42 / **2.49 ms** | 0.26 / 0.49 / 0.90 ms |
+| Capacity: 500 in flight, 5,000 requests | 1 | 408 | 75 / 192 / 330 ms (mostly waiting in line) | 33 / 83 / 173 ms |
+| | 2 | **630** | 48 / 99 / 211 ms (mostly waiting in line) | 25 / 53 / 93 ms |
+| Overhead: steady 100 per second, 3,000 requests | 1 | 100 | 1.77 / 2.98 / **4.73 ms** | 0.26 / 0.57 / 1.13 ms |
+| | 2 | 100 | 1.63 / 2.42 / **2.49 ms** | 0.26 / 0.49 / 0.90 ms |
 
-Both runs had zero errors. The 429 responses come from the `search` team's 30 req/min limit, which the test hits on purpose.
+Both runs had zero errors. Some `429` responses are expected: the test deliberately pushes the `search` team past its limit of 30 requests a minute.
 
-**The <10 ms gateway-overhead target holds at p99 with Redis in the request path on the 4-vCPU runner.** Redis round trips account for about 1 ms of that.
+**The gateway stays under 10 ms of overhead at p99 with Redis in the path.** About 1 ms of that is Redis.
 
-On the earlier 2-vCPU private-repo runner, the same code gave p95 3.9–12.1 ms and p99 7.7–24.5 ms. That runner had too little CPU for six processes, so the tail was scheduling noise. CI therefore gates p95 at 25 ms, as a regression guard against those noisy runners.
+An earlier 2-vCPU runner gave p95 of 3.9 to 12.1 ms and p99 of 7.7 to 24.5 ms with the same code. Six processes shared two CPUs there, so the slow tail was the machine, not the gateway. CI therefore fails a build only if p95 goes above 25 ms. That catches real slowdowns without failing on a noisy machine.
 
-Throughput in closed-loop mode is bounded by the shared VM, which also runs the load generator and mocks. It is a lower bound, not the gateway's ceiling. To scale further, add gateway replicas: all limit and budget state lives in Redis.
+The capacity numbers are a floor, not a ceiling: the load generator and mocks run on the same machine. To handle more traffic, run more copies of the gateway. All limits and budgets live in Redis, so the copies stay in sync.
 
-All values are interpolated within histogram buckets.
+The percentiles are estimated from histogram buckets.
 
-**Local.** Windows 11 laptop with the in-memory store, so there are no Redis round trips:
+## Results on a laptop
 
-| Mode | Throughput | Overhead p50 / p95 / p99 |
+Windows 11 laptop, counters kept in memory instead of Redis:
+
+| Test | Requests per second | Overhead p50 / p95 / p99 |
 | --- | --- | --- |
-| Capacity, 300 in flight | 570 req/s | 0.28 / 0.80 / 0.98 ms |
-| Open loop at 200 req/s | 200 req/s | 0.72 / 1.73 / 2.35 ms |
-| Capacity, 500 in flight, primary outage halfway through | 388 req/s | 0.72 / 2.13 / 2.49 ms; 2,287 requests served by the fallback, zero 5xx |
+| Capacity, 300 in flight | 570 | 0.28 / 0.80 / 0.98 ms |
+| Steady 200 per second | 200 | 0.72 / 1.73 / 2.35 ms |
+| Capacity, 500 in flight, main model taken down halfway | 388 | 0.72 / 2.13 / 2.49 ms; the fallback served 2,287 requests, with no 5xx errors |
 
-**How throughput went from 83 to 630 req/s in CI** (83 and 463 on the 2-vCPU runner, 630 on the 4-vCPU one):
+## How throughput went from 83 to 630 requests per second
 
-1. **httpx was the bottleneck.** Against the same mock provider, httpx fell from 204 to 89 req/s as concurrency rose from 10 to 200, while aiohttp reached 3,346 req/s. The gateway now calls providers through aiohttp (`app/http.py`).
-2. **Admission is one Redis round trip.** Rate limiting and budget reservation run in a single Lua script.
-3. **Lighter middleware.** A pure ASGI middleware replaced Starlette's `BaseHTTPMiddleware`.
-4. **Trace sampling.** Head-based sampling uses `GATEWAY_OTEL_SAMPLE_RATIO`, set to 0.1 in compose. Span export holds the GIL in a background thread.
+83 and 463 were measured on the 2-vCPU runner; 630 on the 4-vCPU one.
 
-`gc.freeze()` also runs after startup.
+1. **The HTTP client was the bottleneck.** Against the same mock model, httpx dropped from 204 to 89 requests per second as concurrency rose from 10 to 200. aiohttp reached 3,346. The gateway now calls models through aiohttp (`app/http.py`).
+2. **One trip to Redis per request.** The rate-limit check and the budget reservation run together in a single Lua script.
+3. **Lighter middleware.** A plain ASGI middleware replaced Starlette's `BaseHTTPMiddleware`.
+4. **Fewer traces.** Only a share of requests is traced, set by `GATEWAY_OTEL_SAMPLE_RATIO` (0.1 in Docker Compose). Exporting traces holds Python's global lock, so tracing every request slowed everything down.
 
-To scale further, run more gateway replicas: Redis already holds all shared limit and budget state.
+The gateway also calls `gc.freeze()` after startup, so the garbage collector skips objects created at startup.
