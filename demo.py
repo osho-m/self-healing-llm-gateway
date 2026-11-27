@@ -1,9 +1,10 @@
-"""Hugging Face Space entrypoint: the gateway engine in front of a real model.
+"""Hugging Face Space entrypoint: the gateway in front of three open-source models.
 
-Providers (config/policy.space.yml), in fallback order for the default tier:
-  1. Qwen2.5-1.5B-Instruct, run in this process on ZeroGPU (loaded below when a GPU runtime exists);
-  2. Claude, only if the ANTHROPIC_API_KEY Space secret is set;
-  3. a deterministic mock, so the demo keeps answering when everything real is unavailable.
+All three models run inside this Space on ZeroGPU (config/policy.space.yml):
+  economy  -> SmolLM2-1.7B-Instruct
+  balanced -> Qwen2.5-1.5B-Instruct
+  premium  -> Phi-3.5-mini-instruct
+Each tier falls back to the other two models, then to a deterministic mock.
 """
 
 from __future__ import annotations
@@ -27,8 +28,7 @@ log = logging.getLogger("demo")
 
 policy = PolicyManager("config/policy.space.yml")
 DEMO_TEAM = policy.team("demo")
-PRIMARY = "zerogpu-qwen"
-LOCAL_MODEL = policy.policy.provider(PRIMARY).model
+LOCAL = [p for p in policy.policy.providers if p.kind == "local"]  # provider configs, in policy order
 MAX_NEW_TOKENS = 256
 MAX_SESSIONS = 256
 
@@ -38,37 +38,44 @@ except ImportError:
     spaces = None
 
 if spaces is not None:
-    # ZeroGPU: place the model on "cuda" at import time; a real GPU is attached only while a
+    # ZeroGPU: models are placed on "cuda" at startup; a real GPU is attached only while a
     # @spaces.GPU function runs.
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    _tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL)
-    _model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL, dtype=torch.bfloat16).to("cuda")
+    _loaded = {}
+    for cfg in LOCAL:
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(cfg.model)
+            model = AutoModelForCausalLM.from_pretrained(cfg.model, dtype=torch.bfloat16).to("cuda")
+        except Exception:  # one model failing to load must not take the others down
+            log.exception("could not load %s; the gateway will skip it", cfg.model)
+            continue
+        _loaded[cfg.model] = (tokenizer, model)
 
     @spaces.GPU(duration=30)
-    def _generate(messages: list[dict[str, str]], max_tokens: int) -> LocalGeneration:
-        inputs = _tokenizer.apply_chat_template(
+    def _run(model_id: str, messages: list[dict[str, str]], max_tokens: int) -> LocalGeneration:
+        tokenizer, model = _loaded[model_id]
+        inputs = tokenizer.apply_chat_template(
             messages, add_generation_prompt=True, return_dict=True, return_tensors="pt"
         ).to("cuda")
-        output = _model.generate(**inputs, max_new_tokens=min(max_tokens, MAX_NEW_TOKENS), do_sample=False)
+        output = model.generate(**inputs, max_new_tokens=min(max_tokens, MAX_NEW_TOKENS), do_sample=False)
         prompt_len = inputs["input_ids"].shape[-1]
         new_tokens = output[0][prompt_len:]
-        text = _tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
         return LocalGeneration(text=text, prompt_tokens=int(prompt_len), completion_tokens=int(new_tokens.shape[-1]))
 
-    register_local_model(LOCAL_MODEL, _generate)
+    for cfg in [c for c in LOCAL if c.model in _loaded]:
+        register_local_model(cfg.model, lambda messages, max_tokens, m=cfg.model: _run(m, messages, max_tokens))
 else:
-    log.warning("no ZeroGPU runtime; %s is skipped and traffic goes to the next provider", PRIMARY)
+    log.warning("no ZeroGPU runtime: the local models are skipped and the mock answers")
 
 
-# One gateway per browser session, so one visitor's outage toggle and circuit state never affect
-# another. Least recently used sessions are evicted.
+# One gateway per browser session, so one visitor's outage switches and circuit state never
+# affect another. The least recently used sessions are evicted.
 #
-# Rate limits and the daily budget live in ONE store shared by every session: they are a
-# process-wide cap on spend. Per-session stores would let anyone reset the budget by opening a
-# new tab. The store is in memory, so a Space restart resets it; for a paid provider also set a
-# spend limit at the provider (e.g. in the Anthropic Console) as the hard backstop.
+# Rate limits and the daily budget live in ONE store shared by every session, so they cap the
+# whole Space. Opening a new tab cannot reset them. The store is in memory: a restart resets it.
 _shared_store = MemoryStore()
 _sessions: OrderedDict[str, Gateway] = OrderedDict()
 # Gradio runs sync handlers in worker threads and async ones on the event loop.
@@ -103,7 +110,7 @@ def health(gateway: Gateway) -> dict:
 async def send_request(prompt: str, tier: str, priority: str, request: gr.Request) -> tuple[str, str, dict, dict]:
     gateway = gateway_for(request)
     if not prompt or not prompt.strip():
-        return "Enter a prompt to send through the gateway.", "", {}, health(gateway)
+        return "Type a prompt first.", "", {}, health(gateway)
     req = ChatRequest(model=tier, messages=[ChatMessage(role="user", content=prompt.strip())], priority=priority)
     try:
         adm = await gateway.admit(DEMO_TEAM, req)
@@ -116,14 +123,14 @@ async def send_request(prompt: str, tier: str, priority: str, request: gr.Reques
     return resp.choices[0].message.content, served, details, health(gateway)
 
 
-def set_primary_outage(enabled: bool, request: gr.Request) -> tuple[str, dict]:
+def set_outages(down: list[str], request: gr.Request) -> tuple[str, dict]:
     gateway = gateway_for(request)
-    gateway.faults.set(PRIMARY, outage=enabled)
-    msg = (
-        f"Outage on {PRIMARY}: requests retry, the circuit opens, and the next provider in the tier serves."
-        if enabled
-        else f"{PRIMARY} restored: after the cooldown, one half-open request closes the circuit."
-    )
+    for cfg in LOCAL:
+        gateway.faults.set(cfg.name, outage=cfg.name in down)
+    if down:
+        msg = f"Simulated outage: {', '.join(down)}. Requests retry, the circuit opens, and the next model serves."
+    else:
+        msg = "All models restored. After the cooldown, one test request closes each open circuit."
     return msg, health(gateway)
 
 
@@ -135,15 +142,16 @@ async def run_probe(request: gr.Request) -> dict:
 
 with gr.Blocks(title="Self-Healing LLM Gateway") as demo:
     gr.Markdown(
-        f"""
+        """
     # Self-Healing LLM Gateway
-    Requests go through the gateway engine: per-team rate limits and a daily budget, retries with
-    backoff, circuit breakers, and tier-based failover.
+    Every request goes through the gateway. It checks your rate limit, picks a model for the tier
+    you chose, retries if the model fails, and switches to the next model when one is down.
 
-    **Providers, in fallback order:** `{LOCAL_MODEL}` running in this Space on ZeroGPU, then Claude
-    (only if the Space owner configured a key), then a deterministic fallback. The first request
-    may take a few extra seconds while a GPU is attached. When your daily GPU quota is used up, the
-    gateway fails over automatically.
+    **Three open-source models run in this Space:** SmolLM2-1.7B (economy), Qwen2.5-1.5B (balanced)
+    and Phi-3.5-mini (premium). Each tier falls back to the other two. No paid API is used.
+
+    The first request can take a few seconds while a GPU is attached. If your free GPU time runs
+    out, the gateway fails over on its own.
 
     Source: [github.com/osho-m/self-healing-llm-gateway](https://github.com/osho-m/self-healing-llm-gateway)
     """
@@ -153,24 +161,24 @@ with gr.Blocks(title="Self-Healing LLM Gateway") as demo:
             prompt = gr.Textbox(
                 label="Prompt", value="In two sentences, what does a circuit breaker do in a web service?", lines=4
             )
-            tier = gr.Dropdown(["balanced", "economy", "premium"], value="balanced", label="Capability tier")
+            tier = gr.Dropdown(["balanced", "economy", "premium"], value="balanced", label="Tier")
             priority = gr.Radio(["realtime", "batch"], value="realtime", label="Priority")
             send = gr.Button("Send through gateway", variant="primary")
-            outage = gr.Checkbox(label=f"Simulate an outage of {PRIMARY}", value=False)
-            probe = gr.Button("Run health probe")
+            outages = gr.CheckboxGroup([cfg.name for cfg in LOCAL], label="Simulate an outage of")
+            probe = gr.Button("Run health check")
         with gr.Column(scale=3):
             answer = gr.Textbox(label="Response", lines=6)
             served_by = gr.Textbox(label="Served by")
-            metadata = gr.JSON(label="Routing, cost and budget metadata")
-            status = gr.Textbox(label="Resilience status")
-            health_view = gr.JSON(label="Provider health and circuit state", value=health(_new_gateway()))
+            metadata = gr.JSON(label="Routing, retries and usage")
+            status = gr.Textbox(label="What is happening")
+            health_view = gr.JSON(label="Model health and circuit state", value=health(_new_gateway()))
     send.click(send_request, inputs=[prompt, tier, priority], outputs=[answer, served_by, metadata, health_view])
-    outage.change(set_primary_outage, inputs=outage, outputs=[status, health_view])
+    outages.change(set_outages, inputs=outages, outputs=[status, health_view])
     probe.click(run_probe, outputs=health_view)
     gr.Markdown(
-        "Try it: send a request, enable the outage, and send again to see the retries, the open circuit "
-        "and the fallback in the metadata. Each visitor's outage switch and circuits are isolated; rate "
-        "limits and the daily budget are shared by all visitors."
+        "Try it: send a request, tick the model your tier starts with, and send again. The metadata shows "
+        "the failed attempts and which model answered instead. Your outage switches only affect you; rate "
+        "limits are shared by everyone using the Space."
     )
 
 

@@ -8,6 +8,10 @@ ZeroGPU's ``@spaces.GPU``) stay in the deployment code.
 
 A provider whose model is not registered reports itself unavailable, so the gateway skips it the
 same way it skips a provider whose API key is not set.
+
+A timeout cannot stop a running thread: Python has no way to cancel it. So after a timeout the
+model stays unavailable until that worker actually finishes. The gateway then fails over to the
+next provider instead of starting a second generation on the same model.
 """
 
 from __future__ import annotations
@@ -31,7 +35,19 @@ class LocalGeneration:
 GenerateFn = Callable[[list[dict[str, str]], int], LocalGeneration]
 
 _REGISTRY: dict[str, GenerateFn] = {}
+# model -> "worker finished" events, one per generation that timed out while running.
+_STALLED: dict[str, list[threading.Event]] = {}
 _LOCK = threading.Lock()
+
+
+def _stalled(model: str) -> bool:
+    with _LOCK:
+        pending = [done for done in _STALLED.get(model, []) if not done.is_set()]
+        if pending:
+            _STALLED[model] = pending
+            return True
+        _STALLED.pop(model, None)
+        return False
 
 
 def register_local_model(model: str, generate: GenerateFn) -> None:
@@ -46,18 +62,32 @@ def unregister_local_model(model: str) -> None:
 
 class LocalModelProvider(Provider):
     def is_available(self) -> bool:
-        return self.config.model in _REGISTRY
+        return self.config.model in _REGISTRY and not _stalled(self.config.model)
 
     async def complete(self, request: CompletionRequest) -> CompletionResult:
         generate = _REGISTRY.get(self.config.model)
         if generate is None:
             raise ProviderError(self.name, "not_registered", f"no local model {self.config.model!r}", retryable=False)
+        model = self.config.model
+        if _stalled(model):
+            raise ProviderError(self.name, "busy", "an earlier generation is still running", retryable=True)
+        started, done = threading.Event(), threading.Event()
+
+        def run() -> LocalGeneration:
+            started.set()
+            try:
+                return generate(request.messages, request.max_tokens)
+            finally:
+                done.set()
+
         try:
             # asyncio.to_thread copies contextvars, so request-scoped context reaches the runtime.
-            out = await asyncio.wait_for(
-                asyncio.to_thread(generate, request.messages, request.max_tokens), timeout=self.config.timeout_s
-            )
+            out = await asyncio.wait_for(asyncio.to_thread(run), timeout=self.config.timeout_s)
         except TimeoutError as exc:
+            with _LOCK:
+                # A call cancelled while still queued never runs, so it must not block the model.
+                if started.is_set() and not done.is_set():
+                    _STALLED.setdefault(model, []).append(done)  # unavailable until every such worker exits
             raise ProviderError(self.name, "timeout", "local generation timed out", retryable=True) from exc
         except Exception as exc:
             # Runtime failures (GPU quota exhausted, out of memory, device errors) are transient from
