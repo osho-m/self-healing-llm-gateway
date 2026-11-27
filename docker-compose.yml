@@ -1,0 +1,89 @@
+name: llm-gateway
+
+x-mock: &mock
+  build: .
+  command: ["uvicorn", "mock_provider.server:app", "--host", "0.0.0.0", "--port", "9000", "--no-access-log"]
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health', timeout=2)"]
+    interval: 5s
+    retries: 10
+
+services:
+  gateway:
+    build: .
+    ports: ["8000:8000"]
+    environment:
+      GATEWAY_ENVIRONMENT: ${GATEWAY_ENVIRONMENT:-development}
+      GATEWAY_REDIS_URL: redis://redis:6379/0
+      GATEWAY_ADMIN_API_KEY: ${GATEWAY_ADMIN_API_KEY:-demo-admin-key-change-me-0000}
+      GATEWAY_POLICY_PATH: /app/config/policy.yml
+      GATEWAY_OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    volumes:
+      # Edit this file while the stack runs: the gateway hot-reloads it.
+      - ./config/policy.compose.yml:/app/config/policy.yml:ro
+      - gateway-data:/app/data
+    depends_on:
+      redis: { condition: service_healthy }
+      mock-primary: { condition: service_healthy }
+      mock-secondary: { condition: service_healthy }
+    restart: unless-stopped
+
+  mock-primary:
+    <<: *mock
+    environment: { MOCK_PROVIDER_NAME: mock-primary, MOCK_LATENCY_MS: "25" }
+    ports: ["9001:9000"]
+
+  mock-secondary:
+    <<: *mock
+    environment: { MOCK_PROVIDER_NAME: mock-secondary, MOCK_LATENCY_MS: "40" }
+    ports: ["9002:9000"]
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+    volumes: [redis-data:/data]
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=7d", "--web.enable-lifecycle"]
+    volumes:
+      - ./deploy/prometheus:/etc/prometheus:ro
+    ports: ["9090:9090"]
+    depends_on: [gateway, alertmanager]
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.0
+    entrypoint: ["/bin/sh", "/etc/alertmanager/entrypoint.sh"]
+    environment:
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-http://127.0.0.1:9/slack-disabled}
+    volumes:
+      - ./deploy/alertmanager:/etc/alertmanager:ro
+    ports: ["9093:9093"]
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.64.0
+    environment: { COLLECTOR_OTLP_ENABLED: "true" }
+    ports: ["16686:16686"]
+
+volumes:
+  redis-data:
+  gateway-data:
