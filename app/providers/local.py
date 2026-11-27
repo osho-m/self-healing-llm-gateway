@@ -1,0 +1,80 @@
+"""In-process model provider (``kind: local``).
+
+Runs a model inside the gateway process, e.g. a Hugging Face Transformers model on a GPU. The
+policy names the model with ``model:``; the hosting code registers a generate function for that
+name with :func:`register_local_model`. Keeping the model runtime outside this package means the
+gateway does not depend on torch/transformers, and platform-specific wrappers (such as Hugging Face
+ZeroGPU's ``@spaces.GPU``) stay in the deployment code.
+
+A provider whose model is not registered reports itself unavailable, so the gateway skips it the
+same way it skips a provider whose API key is not set.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import threading
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
+
+from app.providers.base import CompletionRequest, CompletionResult, Provider, ProviderError, StreamChunk
+
+
+@dataclass(frozen=True)
+class LocalGeneration:
+    text: str
+    prompt_tokens: int
+    completion_tokens: int
+
+
+# (messages, max_tokens) -> LocalGeneration. Called in a worker thread; may block.
+GenerateFn = Callable[[list[dict[str, str]], int], LocalGeneration]
+
+_REGISTRY: dict[str, GenerateFn] = {}
+_LOCK = threading.Lock()
+
+
+def register_local_model(model: str, generate: GenerateFn) -> None:
+    with _LOCK:
+        _REGISTRY[model] = generate
+
+
+def unregister_local_model(model: str) -> None:
+    with _LOCK:
+        _REGISTRY.pop(model, None)
+
+
+class LocalModelProvider(Provider):
+    def is_available(self) -> bool:
+        return self.config.model in _REGISTRY
+
+    async def complete(self, request: CompletionRequest) -> CompletionResult:
+        generate = _REGISTRY.get(self.config.model)
+        if generate is None:
+            raise ProviderError(self.name, "not_registered", f"no local model {self.config.model!r}", retryable=False)
+        try:
+            # asyncio.to_thread copies contextvars, so request-scoped context reaches the runtime.
+            out = await asyncio.wait_for(
+                asyncio.to_thread(generate, request.messages, request.max_tokens), timeout=self.config.timeout_s
+            )
+        except TimeoutError as exc:
+            raise ProviderError(self.name, "timeout", "local generation timed out", retryable=True) from exc
+        except Exception as exc:
+            # Runtime failures (GPU quota exhausted, out of memory, device errors) are transient from
+            # the gateway's point of view: retry, then fail over to the next provider in the tier.
+            raise ProviderError(self.name, "local_runtime", f"{type(exc).__name__}: {exc}", retryable=True) from exc
+        return CompletionResult(
+            content=out.text,
+            prompt_tokens=out.prompt_tokens,
+            completion_tokens=out.completion_tokens,
+            model=self.config.model,
+        )
+
+    async def stream(self, request: CompletionRequest) -> AsyncIterator[StreamChunk]:
+        # Generation runs to completion in one call; relay it word by word so clients see SSE.
+        result = await self.complete(request)
+        for i, word in enumerate(result.content.split(" ")):
+            yield StreamChunk(delta=word if i == 0 else " " + word)
+        yield StreamChunk(
+            prompt_tokens=result.prompt_tokens, completion_tokens=result.completion_tokens, finish_reason="stop"
+        )

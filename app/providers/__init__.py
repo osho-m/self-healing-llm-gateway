@@ -13,6 +13,7 @@ from app.providers.base import (
     StreamChunk,
     estimate_tokens,
 )
+from app.providers.local import LocalModelProvider
 from app.providers.mock import MockProvider
 from app.providers.openai import OllamaProvider, OpenAICompatibleProvider
 
@@ -21,6 +22,7 @@ _KINDS: dict[str, type[Provider]] = {
     "openai": OpenAICompatibleProvider,
     "ollama": OllamaProvider,
     "anthropic": AnthropicProvider,
+    "local": LocalModelProvider,
 }
 
 
