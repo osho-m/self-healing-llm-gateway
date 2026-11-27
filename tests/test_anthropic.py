@@ -1,6 +1,5 @@
 """AnthropicProvider (official SDK) against a local fake of the Messages API, over a real socket."""
 
-import contextlib
 import json
 
 import pytest
@@ -84,6 +83,16 @@ class FakeAnthropic:
                     text=None, stop="refusal", stop_details={"type": "refusal", "category": "cyber", "explanation": "x"}
                 )
             )
+        if self.mode == "stream_overloaded" and body.get("stream"):
+            events = [STREAM[0], {"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}]
+            return web.Response(text=sse(events), content_type="text/event-stream")
+        if self.mode == "stream_drop" and body.get("stream"):
+            resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            resp.enable_chunked_encoding()
+            await resp.prepare(request)
+            await resp.write(sse(STREAM[:3]).encode())
+            request.transport.close()  # connection dies mid-stream
+            return resp
         if body.get("stream"):
             return web.Response(text=sse(STREAM), content_type="text/event-stream")
         return web.json_response(message())
@@ -190,13 +199,13 @@ async def test_cross_origin_redirect_never_receives_the_api_key(fake):
     fake.redirect_to = str(attacker.make_url("/stolen"))
     p = make(fake)
     try:
-        # Either outcome is fine; what matters is where the key went.
-        with contextlib.suppress(ProviderError):
+        with pytest.raises(ProviderError) as exc:
             await p.complete(REQ)
     finally:
         await p.aclose()
         await attacker.close()
-    assert all(value is None for value in other.stolen)
+    assert exc.value.kind == "unexpected_redirect" and not exc.value.retryable
+    assert other.stolen == []  # redirects are not followed: neither key nor prompt leaves the origin
 
 
 async def test_connection_refused_is_retryable(monkeypatch):
@@ -230,3 +239,15 @@ async def test_missing_api_key_is_a_clean_non_retryable_error(monkeypatch):
     with pytest.raises(ProviderError) as exc:
         await p.complete(REQ)
     assert exc.value.kind == "auth" and not exc.value.retryable
+
+
+@pytest.mark.parametrize(("mode", "kind"), [("stream_overloaded", "server_error"), ("stream_drop", "connection")])
+async def test_mid_stream_failures_are_retryable_provider_errors(fake, mode, kind):
+    fake.mode = mode
+    p = make(fake)
+    try:
+        with pytest.raises(ProviderError) as exc:
+            [c async for c in p.stream(REQ)]
+    finally:
+        await p.aclose()
+    assert exc.value.retryable and exc.value.kind in (kind, "timeout")
