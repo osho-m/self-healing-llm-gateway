@@ -146,17 +146,20 @@ class Gateway:
         prompt_est = sum(estimate_tokens(m["content"]) for m in messages)
         token_need = prompt_est + req.max_tokens
 
-        with tracer.start_as_current_span("gateway.rate_limit") as span:
-            decision = await self.store.acquire(
+        estimate = self._max_cost(req.model, prompt_est, req.max_tokens)
+        with tracer.start_as_current_span("gateway.admission") as span:
+            decision, budget = await self.store.admit(
                 team.team_id,
                 team.requests_per_minute,
                 team.tokens_per_minute,
                 token_need,
                 req.priority,
                 team.batch_reserve_ratio,
+                estimate,
+                team.daily_budget_usd,
             )
             span.set_attribute("gateway.allowed", decision.allowed)
-        if not decision.allowed:
+        if budget is None:
             self.metrics.rate_limited.labels(team.team_id, decision.limit or "unknown", req.priority).inc()
             msg = (
                 f"Rate limit exceeded ({decision.limit} per minute) for team {team.team_id!r}."
@@ -166,11 +169,6 @@ class Gateway:
             if req.priority == "batch":
                 msg += " Batch traffic cannot use the capacity reserved for realtime requests."
             raise GatewayError(429, "rate_limit_exceeded", msg, retry_after=decision.retry_after_s)
-
-        with tracer.start_as_current_span("gateway.budget") as span:
-            estimate = self._max_cost(req.model, prompt_est, req.max_tokens)
-            budget = await self.store.reserve_budget(team.team_id, estimate, team.daily_budget_usd)
-            span.set_attribute("gateway.budget_utilization", budget.utilization)
         self.metrics.budget_spend.labels(team.team_id).set(budget.spent_usd)
         if not budget.allowed:
             self.metrics.rate_limited.labels(team.team_id, "budget", req.priority).inc()
