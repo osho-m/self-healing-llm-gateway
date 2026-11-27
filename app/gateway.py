@@ -336,7 +336,9 @@ class Gateway:
         tier = adm.req.model
         self.metrics.requests.labels(adm.team.team_id, tier, provider, "200", adm.req.priority).inc()
         self.metrics.latency.labels(tier, provider).observe(latency)
-        self.metrics.overhead.observe(max(0.0, latency - adm.provider_time))
+        if not adm.req.stream:
+            # Streams record overhead at first byte instead (see _sse); total time includes generation.
+            self.metrics.overhead.observe(max(0.0, latency - adm.provider_time))
         log.info(
             "request served",
             extra={
@@ -395,7 +397,9 @@ class Gateway:
                     if breaker.state != CLOSED or attempt == res.max_retries:
                         break
                     self.metrics.retries.labels(name, err.kind).inc()
-                    await self._sleep(self._backoff(attempt))
+                    backoff = self._backoff(attempt)
+                    await self._sleep(backoff)
+                    adm.provider_time += backoff
                     continue
                 adm.provider_time += time.perf_counter() - t0
                 if idx > 0:
@@ -439,7 +443,10 @@ class Gateway:
                 yield c
 
         try:
-            yield frame({"role": "assistant", "content": ""})
+            first = frame({"role": "assistant", "content": ""})
+            # Time-to-first-byte minus provider time-to-first-chunk (and backoff) = gateway overhead.
+            self.metrics.overhead.observe(max(0.0, time.perf_counter() - adm.started - adm.provider_time))
+            yield first
             async for chunk in chunks():
                 if chunk.prompt_tokens is not None:
                     prompt_t = chunk.prompt_tokens

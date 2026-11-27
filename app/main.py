@@ -49,7 +49,11 @@ def create_app(
 
     policy = policy or PolicyManager(settings.policy_path)
     if store is None:
-        store = RedisStore(settings.redis_url) if settings.redis_url else MemoryStore()
+        store = (
+            RedisStore(settings.redis_url, max_connections=settings.redis_max_connections)
+            if settings.redis_url
+            else MemoryStore()
+        )
     gateway = Gateway(policy, store, Metrics(), AuditLog(settings.audit_log_path), client=client, sleep=sleep)
 
     @asynccontextmanager
