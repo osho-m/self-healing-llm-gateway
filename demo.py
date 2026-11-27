@@ -12,6 +12,19 @@ from app.policy import PolicyManager
 from app.schemas import ChatMessage, ChatRequest
 from app.stores import MemoryStore
 
+try:  # Present only on Hugging Face ZeroGPU hardware.
+    import spaces
+except ImportError:
+    spaces = None
+
+if spaces is not None:
+    # ZeroGPU refuses to start a Space without at least one @spaces.GPU function. The gateway is
+    # CPU-only (it routes to providers, it does not run models), so this is never called.
+    @spaces.GPU(duration=1)
+    def _zerogpu_requires_a_gpu_function() -> None:
+        return None
+
+
 policy = PolicyManager("config/policy.example.yml")
 gateway = Gateway(policy, MemoryStore(), Metrics(), AuditLog(None))
 DEMO_TEAM = policy.team("demo")
