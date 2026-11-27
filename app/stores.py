@@ -66,6 +66,23 @@ class Store(ABC):
     async def reserve_budget(self, team: str, amount_usd: float, cap_usd: float) -> BudgetDecision: ...
 
     @abstractmethod
+    async def admit(
+        self,
+        team: str,
+        rpm: int,
+        tpm: int,
+        tokens: int,
+        priority: str,
+        reserve_ratio: float,
+        amount_usd: float,
+        cap_usd: float,
+    ) -> tuple[RateDecision, BudgetDecision | None]:
+        """Atomically check rate limits and reserve budget in one round trip.
+
+        Nothing is consumed unless both pass. ``BudgetDecision`` is None when the rate limit rejected first.
+        """
+
+    @abstractmethod
     async def settle_budget(self, team: str, reserved_usd: float, actual_usd: float) -> float:
         """Release a reservation and record actual spend. Returns spend so far today."""
 
@@ -132,6 +149,35 @@ class MemoryStore(Store):
             rb.tokens -= 1
             tb.tokens -= tokens
             return RateDecision(True, 0.0, None, rb.tokens, tb.tokens)
+
+    async def admit(self, team, rpm, tpm, tokens, priority, reserve_ratio, amount_usd, cap_usd):
+        key = (team, utc_day())
+        amount, cap = int(amount_usd * MICRO), int(cap_usd * MICRO)
+        async with self._lock:
+            now = self._clock()
+            rb = self._req.setdefault(team, _Bucket(rpm, now))
+            tb = self._tok.setdefault(team, _Bucket(tpm, now))
+            rb.refill(rpm, now)
+            tb.refill(tpm, now)
+            r_need = 1 + _reserve_floor(rpm, reserve_ratio, priority)
+            t_need = tokens + _reserve_floor(tpm, reserve_ratio, priority)
+            if tokens > tpm:
+                return RateDecision(False, 60.0, "tokens", rb.tokens, tb.tokens), None
+            if rb.tokens < r_need:
+                wait = (r_need - rb.tokens) * 60.0 / rpm
+                return RateDecision(False, wait, "requests", rb.tokens, tb.tokens), None
+            if tb.tokens < t_need:
+                wait = (t_need - tb.tokens) * 60.0 / tpm
+                return RateDecision(False, wait, "tokens", rb.tokens, tb.tokens), None
+            spent, reserved = self._spent.get(key, 0), self._reserved.get(key, 0)
+            if spent + reserved + amount > cap:
+                rate = RateDecision(False, 0.0, "budget", rb.tokens, tb.tokens)
+                return rate, BudgetDecision(False, spent / MICRO, reserved / MICRO, cap_usd)
+            rb.tokens -= 1
+            tb.tokens -= tokens
+            self._reserved[key] = reserved + amount
+            rate = RateDecision(True, 0.0, None, rb.tokens, tb.tokens)
+            return rate, BudgetDecision(True, spent / MICRO, (reserved + amount) / MICRO, cap_usd)
 
     async def rate_status(self, team, rpm, tpm) -> dict[str, float]:
         async with self._lock:
@@ -218,6 +264,46 @@ redis.call('EXPIRE', KEYS[2], 172800)
 return {1, spent, reserved}
 """
 
+# Rate limit + budget reservation in one atomic script (one round trip per request).
+# KEYS: req_bucket, tok_bucket, spent, reserved. ARGV: rpm, tpm, tokens, req_floor, tok_floor, amount, cap
+_ADMIT_LUA = """
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+local rpm, tpm = tonumber(ARGV[1]), tonumber(ARGV[2])
+local need_t, rfloor, tfloor = tonumber(ARGV[3]), tonumber(ARGV[4]), tonumber(ARGV[5])
+local amount, cap = tonumber(ARGV[6]), tonumber(ARGV[7])
+
+local function load(key, c)
+  local v = redis.call('HMGET', key, 'tokens', 'ts')
+  local tokens, ts = tonumber(v[1]), tonumber(v[2])
+  if tokens == nil then return c end
+  return math.min(c, tokens + math.max(0, now - ts) * c / 60)
+end
+
+local r, k = load(KEYS[1], rpm), load(KEYS[2], tpm)
+local spent = tonumber(redis.call('GET', KEYS[3]) or '0')
+local reserved = tonumber(redis.call('GET', KEYS[4]) or '0')
+local allowed, limit, wait, budget_ok = 1, '', 0, 1
+if need_t > tpm then
+  allowed, limit, wait, budget_ok = 0, 'tokens', 60, -1
+elseif r < 1 + rfloor then
+  allowed, limit, wait, budget_ok = 0, 'requests', (1 + rfloor - r) * 60 / rpm, -1
+elseif k < need_t + tfloor then
+  allowed, limit, wait, budget_ok = 0, 'tokens', (need_t + tfloor - k) * 60 / tpm, -1
+elseif spent + reserved + amount > cap then
+  allowed, limit, budget_ok = 0, 'budget', 0
+else
+  r, k = r - 1, k - need_t
+  reserved = redis.call('INCRBY', KEYS[4], amount)
+  redis.call('EXPIRE', KEYS[4], 172800)
+end
+redis.call('HSET', KEYS[1], 'tokens', r, 'ts', now)
+redis.call('HSET', KEYS[2], 'tokens', k, 'ts', now)
+redis.call('EXPIRE', KEYS[1], 120)
+redis.call('EXPIRE', KEYS[2], 120)
+return {allowed, limit, tostring(wait), tostring(r), tostring(k), budget_ok, spent, reserved}
+"""
+
 # KEYS: spent, reserved. ARGV: reserved_amount, actual
 _SETTLE_LUA = """
 local r = redis.call('DECRBY', KEYS[2], ARGV[1])
@@ -249,6 +335,7 @@ class RedisStore(Store):
         self._acquire = self.r.register_script(_ACQUIRE_LUA)
         self._reserve = self.r.register_script(_RESERVE_LUA)
         self._settle = self.r.register_script(_SETTLE_LUA)
+        self._admit = self.r.register_script(_ADMIT_LUA)
 
     def _rk(self, team: str) -> list[str]:
         return [f"{self.p}:rl:{{{team}}}:req", f"{self.p}:rl:{{{team}}}:tok"]
@@ -262,6 +349,19 @@ class RedisStore(Store):
         tfloor = _reserve_floor(tpm, reserve_ratio, priority)
         allowed, limit, wait, r, k = await self._acquire(keys=self._rk(team), args=[rpm, tpm, tokens, rfloor, tfloor])
         return RateDecision(bool(int(allowed)), float(wait), limit or None, float(r), float(k))
+
+    async def admit(self, team, rpm, tpm, tokens, priority, reserve_ratio, amount_usd, cap_usd):
+        rfloor = _reserve_floor(rpm, reserve_ratio, priority)
+        tfloor = _reserve_floor(tpm, reserve_ratio, priority)
+        args = [rpm, tpm, tokens, rfloor, tfloor, int(amount_usd * MICRO), int(cap_usd * MICRO)]
+        allowed, limit, wait, r, k, budget_ok, spent, reserved = await self._admit(
+            keys=self._rk(team) + self._bk(team), args=args
+        )
+        rate = RateDecision(bool(int(allowed)), float(wait), limit or None, float(r), float(k))
+        if int(budget_ok) < 0:
+            return rate, None
+        budget = BudgetDecision(bool(int(budget_ok)), int(spent) / MICRO, int(reserved) / MICRO, cap_usd)
+        return rate, budget
 
     async def rate_status(self, team, rpm, tpm) -> dict[str, float]:
         now = time.time()

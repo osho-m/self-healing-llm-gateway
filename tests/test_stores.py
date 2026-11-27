@@ -59,3 +59,23 @@ async def test_overrides_roundtrip(store):
     assert await store.get_overrides() == {"x": {"requests_per_minute": 5, "daily_budget_usd": 2.0}}
     await store.set_overrides("x", None)
     assert await store.get_overrides() == {}
+
+
+async def test_admit_budget_rejection_does_not_consume_rate_tokens(store):
+    rate, budget = await store.admit("a1", 2, 1000, 10, "realtime", 0.0, 5.0, 1.0)
+    assert not rate.allowed and rate.limit == "budget" and budget is not None and not budget.allowed
+    # Both request tokens are still available.
+    assert all([(await store.admit("a1", 2, 1000, 10, "realtime", 0.0, 0.1, 1.0))[0].allowed for _ in range(2)])
+    assert not (await store.admit("a1", 2, 1000, 10, "realtime", 0.0, 0.1, 1.0))[0].allowed
+
+
+async def test_admit_rate_rejection_reserves_no_budget(store):
+    await store.admit("a2", 1, 1000, 10, "realtime", 0.0, 0.1, 1.0)
+    rate, budget = await store.admit("a2", 1, 1000, 10, "realtime", 0.0, 0.1, 1.0)
+    assert not rate.allowed and rate.limit == "requests" and budget is None
+    assert await store.budget_status("a2") == (pytest.approx(0.0), pytest.approx(0.1))
+
+
+async def test_admit_exact_under_concurrency(store):
+    results = await asyncio.gather(*(store.admit("a3", 1000, 10**6, 1, "realtime", 0.0, 0.1, 1.0) for _ in range(50)))
+    assert sum(r.allowed for r, _ in results) == 10
