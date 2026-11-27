@@ -151,6 +151,12 @@ class AnthropicProvider(Provider):
         category = getattr(details, "category", None) or "unspecified"
         return ProviderError(self.name, "content_policy", f"model refused (category: {category})", retryable=False)
 
+    def _tokens(self, value: Any) -> int:
+        # The SDK does not validate response models strictly; a bad count must not break settlement.
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+        raise ProviderError(self.name, "bad_response", f"invalid usage count {value!r}", retryable=True)
+
     async def complete(self, request: CompletionRequest) -> CompletionResult:
         try:
             message = await self._client().messages.create(**self._params(request))
@@ -161,8 +167,8 @@ class AnthropicProvider(Provider):
         text = "".join(block.text for block in message.content if block.type == "text")
         return CompletionResult(
             content=text,
-            prompt_tokens=message.usage.input_tokens,
-            completion_tokens=message.usage.output_tokens,
+            prompt_tokens=self._tokens(message.usage.input_tokens),
+            completion_tokens=self._tokens(message.usage.output_tokens),
             model=message.model,
             finish_reason=_FINISH.get(message.stop_reason or "", message.stop_reason or "stop"),
         )
@@ -172,7 +178,7 @@ class AnthropicProvider(Provider):
             async with self._client().messages.stream(**self._params(request)) as stream:
                 async for event in stream:
                     if event.type == "message_start":
-                        yield StreamChunk(prompt_tokens=event.message.usage.input_tokens)
+                        yield StreamChunk(prompt_tokens=self._tokens(event.message.usage.input_tokens))
                     elif event.type == "content_block_delta" and event.delta.type == "text_delta":
                         yield StreamChunk(delta=event.delta.text)
                     elif event.type == "message_delta":
@@ -180,7 +186,7 @@ class AnthropicProvider(Provider):
                             raise self._refusal(getattr(event.delta, "stop_details", None))
                         reason = event.delta.stop_reason or ""
                         yield StreamChunk(
-                            completion_tokens=event.usage.output_tokens,
+                            completion_tokens=self._tokens(event.usage.output_tokens),
                             finish_reason=_FINISH.get(reason, reason or "stop"),
                         )
         except ProviderError:
