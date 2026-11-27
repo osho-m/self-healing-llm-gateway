@@ -236,6 +236,7 @@ Still open:
 2. Circuit-breaker and health state live in each replica. Share breaker state through Redis if replicas must agree immediately.
 3. Admin SSO/OIDC in place of a shared admin key; audit log shipping to immutable storage.
 4. Idempotency keys and per-request deadline budgets across retries.
-5. Response caching tier, and token counting with provider tokenizers instead of the 4-chars-per-token admission estimate.
+5. `LatencyP99AboveSLA` uses end-to-end duration, which includes long streamed generations; add a time-to-first-token SLO for streams.
+6. Response caching tier, and token counting with provider tokenizers instead of the 4-chars-per-token admission estimate.
 
 See [docs/PLAN.md](docs/PLAN.md) for the build plan and [SECURITY.md](SECURITY.md) for the security model.
