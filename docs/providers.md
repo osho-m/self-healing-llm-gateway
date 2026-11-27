@@ -7,6 +7,7 @@ Each entry under `providers:` in the policy file is one upstream model. Tiers re
 | `openai` | OpenAI-compatible Chat Completions (OpenAI, vLLM, the bundled mock service) | aiohttp |
 | `ollama` | Ollama's OpenAI-compatible `/v1` API | aiohttp |
 | `anthropic` | Anthropic Messages API | official `anthropic` Python SDK, aiohttp backend |
+| `local` | A model running in the gateway's own process, registered with `register_local_model(model, fn)`. Used by the Hugging Face Space to serve Qwen2.5-1.5B-Instruct on ZeroGPU. An unregistered model is reported as not configured and skipped. | none (in-process call, run in a worker thread with `timeout_s`) |
 | `mock` | Deterministic in-process provider for tests and demos | none |
 
 ## Common fields
