@@ -1,6 +1,10 @@
 """Concurrent load test with mixed teams, tiers and priorities; reports measured numbers only.
 
     python loadtests/loadtest.py --url http://localhost:8000 --requests 5000 --concurrency 500 [--outage]
+    python loadtests/loadtest.py --requests 3000 --rate 100     # fixed arrival rate, for latency/overhead SLOs
+
+Closed loop (default) finds capacity: once the gateway saturates, extra in-flight requests wait for CPU
+and that queueing shows up as overhead. Measure the overhead SLO with --rate below capacity.
 
 Gateway overhead is read from the gateway's own `gateway_overhead_seconds` histogram (time spent in the
 gateway excluding provider calls), so it is independent of mock-provider latency.
@@ -67,6 +71,13 @@ async def main() -> None:
     ap.add_argument("--concurrency", type=int, default=500)
     ap.add_argument("--outage", action="store_true", help="simulate a mock-primary outage halfway through")
     ap.add_argument("--admin-key", default="demo-admin-key-change-me-0000")
+    ap.add_argument("--max-overhead-p99-ms", type=float, help="exit 1 if gateway overhead p99 exceeds this")
+    ap.add_argument(
+        "--rate",
+        type=float,
+        default=0.0,
+        help="open-loop arrival rate in req/s (0 = closed loop: as fast as --concurrency allows)",
+    )
     args = ap.parse_args()
 
     connector = aiohttp.TCPConnector(limit=args.concurrency)
@@ -101,6 +112,8 @@ async def main() -> None:
                 "max_tokens": 64,
                 "messages": [{"role": "user", "content": f"load test request {i}"}],
             }
+            if args.rate:
+                await asyncio.sleep(max(0.0, t_start + i / args.rate - time.perf_counter()))
             async with sem:
                 t0 = time.perf_counter()
                 try:
@@ -116,7 +129,7 @@ async def main() -> None:
             if args.outage and done == args.requests // 2:
                 await set_outage(True)
 
-        t0 = time.perf_counter()
+        t0 = t_start = time.perf_counter()
         await asyncio.gather(*(one(i) for i in range(args.requests)))
         wall = time.perf_counter() - t0
         if args.outage:
@@ -132,6 +145,7 @@ async def main() -> None:
     report = {
         "requests": args.requests,
         "concurrency": args.concurrency,
+        "mode": f"open loop @ {args.rate:g} req/s" if args.rate else "closed loop",
         "wall_seconds": round(wall, 2),
         "throughput_rps": round(args.requests / wall, 1),
         "status_counts": dict(statuses),
@@ -148,6 +162,9 @@ async def main() -> None:
         },
     }
     print(json.dumps(report, indent=2))
+    p99 = report["gateway_overhead_ms"]["p99"]
+    if args.max_overhead_p99_ms is not None and (p99 is None or p99 > args.max_overhead_p99_ms):
+        raise SystemExit(f"gateway overhead p99 {p99} ms exceeds {args.max_overhead_p99_ms} ms")
 
 
 if __name__ == "__main__":
