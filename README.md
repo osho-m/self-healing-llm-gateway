@@ -15,7 +15,7 @@ A gateway that sits between your apps and your AI models. It keeps each team wit
 
 - **Limits per team.** Caps requests and tokens per minute for each team.
 - **Budgets in dollars.** Reserves the cost before a call and charges the real cost after, so no team can overspend.
-- **Heals itself.** Retries failed calls, stops sending traffic to a broken model, and switches to the next one. It checks later whether the broken model has recovered.
+- **Heals itself.** Retries failed calls, stops sending traffic to a broken model, and switches to the next one. It checks later whether the broken model has recovered. When you run several copies of the gateway, they share this through Redis.
 - **Works with any model.** Runs three open-source models by default (SmolLM2, Qwen2.5 and Phi-3.5). Paid APIs like Anthropic or OpenAI can be added in the config.
 - **Easy to watch.** Comes with metrics, traces, Grafana dashboards and Slack alerts.
 
@@ -28,7 +28,7 @@ A gateway that sits between your apps and your AI models. It keeps each team wit
 | Speed-up from one fix | 83 to 463 requests per second, after replacing a slow HTTP client |
 | Real model outage | The gateway switched to the backup model and switched back when the model returned |
 | Live demo | Qwen2.5-1.5B answered in 3.3 s. With Qwen down, the gateway switched and Phi-3.5-mini answered in 4.4 s |
-| Tests | 104 tests, run on every change |
+| Tests | 110 tests, run on every change |
 
 How these were measured: [docs/benchmarks.md](docs/benchmarks.md).
 

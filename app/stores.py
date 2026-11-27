@@ -99,6 +99,14 @@ class Store(ABC):
     @abstractmethod
     async def set_overrides(self, team: str, patch: dict[str, Any] | None) -> None: ...
 
+    async def publish_open(self, provider: str, cooldown_s: float) -> None:
+        """Record that ``provider``'s circuit opened for ``cooldown_s``. Never extends an existing record."""
+        return None
+
+    async def open_circuits(self) -> dict[str, float]:
+        """Providers whose circuit a replica opened, with the seconds left in the cooldown."""
+        return {}
+
     async def ping(self) -> bool:
         return True
 
@@ -128,6 +136,7 @@ class MemoryStore(Store):
         self._req: dict[str, _Bucket] = {}
         self._tok: dict[str, _Bucket] = {}
         self._spent: dict[tuple[str, str], int] = {}
+        self._circuits: dict[str, float] = {}  # provider -> expiry (clock time)
         self._reserved: dict[tuple[str, str], int] = {}
         self._overrides: dict[str, dict[str, Any]] = {}
 
@@ -208,6 +217,15 @@ class MemoryStore(Store):
     async def budget_status(self, team) -> tuple[float, float]:
         key = (team, utc_day())
         return self._spent.get(key, 0) / MICRO, self._reserved.get(key, 0) / MICRO
+
+    async def publish_open(self, provider: str, cooldown_s: float) -> None:
+        now = self._clock()
+        if self._circuits.get(provider, 0.0) <= now:  # like Redis SET NX: never extend a live record
+            self._circuits[provider] = now + cooldown_s
+
+    async def open_circuits(self) -> dict[str, float]:
+        now = self._clock()
+        return {p: exp - now for p, exp in self._circuits.items() if exp > now}
 
     async def get_overrides(self):
         return {k: dict(v) for k, v in self._overrides.items()}
@@ -336,6 +354,21 @@ class RedisStore(Store):
         self._reserve = self.r.register_script(_RESERVE_LUA)
         self._settle = self.r.register_script(_SETTLE_LUA)
         self._admit = self.r.register_script(_ADMIT_LUA)
+
+    async def publish_open(self, provider: str, cooldown_s: float) -> None:
+        # NX: a replica that adopted the open must not push the expiry forward, or it never ends.
+        await self.r.set(f"{self.p}:circuit:{provider}", "open", px=max(1, int(cooldown_s * 1000)), nx=True)
+
+    async def open_circuits(self) -> dict[str, float]:
+        prefix = f"{self.p}:circuit:"
+        keys = [k async for k in self.r.scan_iter(match=prefix + "*", count=100)]
+        if not keys:
+            return {}
+        async with self.r.pipeline(transaction=False) as pipe:
+            for k in keys:
+                pipe.pttl(k)
+            ttls = await pipe.execute()
+        return {k[len(prefix) :]: ms / 1000 for k, ms in zip(keys, ttls, strict=True) if ms and ms > 0}
 
     def _rk(self, team: str) -> list[str]:
         return [f"{self.p}:rl:{{{team}}}:req", f"{self.p}:rl:{{{team}}}:tok"]

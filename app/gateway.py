@@ -99,6 +99,7 @@ class Gateway:
                     res.circuit_window_s,
                     res.circuit_cooldown_s,
                     self._on_circuit,
+                    on_local_open=self._share_open,
                 )
                 self.metrics.circuit_state.labels(cfg.name).set(0)
             tracker = self.health.setdefault(cfg.name, HealthTracker(cfg.name))
@@ -129,6 +130,34 @@ class Gateway:
         except Exception:
             log.exception("could not apply runtime overrides")
         self.sync_providers()
+
+    def _share_open(self, provider: str) -> None:
+        """Tell the other replicas that this one opened ``provider``'s circuit (when sharing is on)."""
+        res = self.policy.resilience
+        if not res.share_circuit_state:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._publish_open(provider, res.circuit_cooldown_s))
+        _BACKGROUND_TASKS.add(task)
+        task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+    async def _publish_open(self, provider: str, cooldown_s: float) -> None:
+        try:
+            await self.store.publish_open(provider, cooldown_s)
+        except Exception:  # best effort: the local circuit is already open
+            log.warning("could not share circuit open", extra={"provider": provider}, exc_info=True)
+
+    async def sync_circuits(self) -> None:
+        """Open the circuits another replica opened. Runs in the background when sharing is on."""
+        if not self.policy.resilience.share_circuit_state:
+            return
+        for provider, remaining_s in (await self.store.open_circuits()).items():
+            breaker = self.breakers.get(provider)
+            if breaker is not None:
+                breaker.adopt_open(remaining_s)
 
     def _on_circuit(self, provider: str, old: str, new: str) -> None:
         self.metrics.circuit_state.labels(provider).set(STATE_VALUE[new])

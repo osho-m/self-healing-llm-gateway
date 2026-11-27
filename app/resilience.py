@@ -25,9 +25,13 @@ class CircuitBreaker:
         cooldown_s: float,
         on_change: Callable[[str, str, str], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        on_local_open: Callable[[str], None] | None = None,
     ) -> None:
         self.name, self.threshold, self.window_s, self.cooldown_s = name, threshold, window_s, cooldown_s
         self._on_change, self._clock = on_change, clock
+        # Called only when THIS breaker opens from its own failures, never when it adopts an open
+        # circuit from another replica. Used to share opens without echoing them back.
+        self.on_local_open = on_local_open
         self.state = CLOSED
         self._failures: deque[float] = deque()
         self._opened_at = 0.0
@@ -65,19 +69,36 @@ class CircuitBreaker:
         self._probe_in_flight = False
         self._transition(CLOSED)
 
+    def _open_locally(self, now: float) -> None:
+        self._opened_at = now
+        self._transition(OPEN)
+        if self.on_local_open:
+            self.on_local_open(self.name)
+
     def record_failure(self) -> None:
         now = self._clock()
         self._probe_in_flight = False
         if self.state == HALF_OPEN:
-            self._opened_at = now
-            self._transition(OPEN)
+            self._open_locally(now)
             return
         self._failures.append(now)
         while self._failures and self._failures[0] < now - self.window_s:
             self._failures.popleft()
         if self.state == CLOSED and len(self._failures) >= self.threshold:
-            self._opened_at = now
-            self._transition(OPEN)
+            self._open_locally(now)
+
+    def adopt_open(self, remaining_s: float) -> None:
+        """Open because another replica opened this circuit, ``remaining_s`` before its cooldown ends.
+
+        Only the time left is shared (monotonic clocks differ between machines), so every replica
+        goes half-open at about the same moment. A circuit that is already open is left alone.
+        """
+        if remaining_s <= 0 or self.current_state() == OPEN:
+            return
+        self._failures.clear()
+        self._probe_in_flight = False
+        self._opened_at = self._clock() - max(0.0, self.cooldown_s - remaining_s)
+        self._transition(OPEN)
 
     def release(self) -> None:
         """Release a half-open probe slot without recording an outcome (e.g. non-retryable client error)."""

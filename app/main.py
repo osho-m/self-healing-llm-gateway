@@ -126,6 +126,9 @@ def create_app(
         if settings.health_checks_enabled:
             interval = gateway.policy.resilience.health_check_interval_s
             tasks.append(asyncio.create_task(_loop(interval, gateway.probe_all, "health")))
+        if gateway.policy.resilience.share_circuit_state:
+            interval = gateway.policy.resilience.circuit_sync_interval_s
+            tasks.append(asyncio.create_task(_loop(interval, gateway.sync_circuits, "circuits")))
         await gateway.refresh_policy()
         log.info("gateway started", extra={"environment": settings.environment, "store": type(store).__name__})
         try:
