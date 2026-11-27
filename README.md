@@ -51,7 +51,7 @@ cp .env.example .env
 docker compose up --build
 ```
 
-Open http://localhost:8000/docs for the API, and http://localhost:3000 for Grafana.
+Once it is running on your machine, the API docs are at `localhost:8000/docs` and Grafana is at `localhost:3000`.
 
 Or on your own machine with three open-source models from [Ollama](https://ollama.com):
 
