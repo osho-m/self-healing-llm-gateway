@@ -164,7 +164,7 @@ class Gateway:
     def _chain_configs(self, tier: str) -> list:
         """Providers that can actually serve this tier (falls back to all if none are configured)."""
         chain = [self.policy.provider(p) for p in self.policy.tiers[tier]]
-        return [c for c in chain if c.is_configured()] or chain
+        return [c for c in chain if self._configured(c.name)] or chain
 
     def _max_cost(self, tier: str, prompt_tokens: int, max_tokens: int) -> float:
         # Each provider may raise max_tokens to its floor (min_max_tokens); reserve for that.
