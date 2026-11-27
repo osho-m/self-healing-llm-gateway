@@ -224,7 +224,17 @@ k6 run loadtests/gateway.js                                                   # 
 | steady | 0.56 / 0.97 / 1.72 ms | 4,503 × 200, 497 × 429 (the `search` team's 30 req/min limit) |
 | primary outage at the halfway point | 0.91 / 2.36 / 3.19 ms | 4,404 × 200 (2,475 served by the fallback), 596 × 429, zero 5xx |
 
-Throughput on that machine (about 80 req/s) was limited by the single-process Python mock server, not the gateway: calling the mock directly reached about 100 req/s. Treat the CI `compose-smoke` job log (Linux, Redis-backed) as the reference figure for throughput.
+Throughput on that machine (about 80 req/s) was limited by the single-process Python mock server, not the gateway: calling the mock directly reached about 100 req/s.
+
+**Measured, CI:** the `compose-smoke` job on a GitHub-hosted Linux runner, with the full compose stack (Redis-backed) and the load generator sharing the same small VM. 5,000 requests at 500 concurrency.
+
+| Run | Gateway overhead p50 / p95 / p99 | Outcome |
+| --- | --- | --- |
+| steady | 4.85 / 65.9 / ≥100 ms (the top histogram bucket) | 4,541 × 200, 458 × 429, 1 client-side connection reset; 83 req/s |
+
+This run does **not** meet the <10 ms p99 target. Everything competed for the runner's CPU: the gateway, Redis, both mocks and 500 client coroutines. Overhead here is mostly event-loop queueing, not gateway logic, and this is exactly the situation the `GatewayOverheadHigh` alert reports.
+
+Next step: measure on dedicated hardware with several gateway workers (`uvicorn --workers N` or more replicas) and multi-process mocks, then publish that number.
 
 ## Production notes and backlog
 
