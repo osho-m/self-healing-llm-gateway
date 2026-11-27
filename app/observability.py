@@ -72,13 +72,20 @@ class Metrics:
 tracer = trace.get_tracer("llm-gateway")
 
 
-def setup_tracing(service_name: str, otlp_endpoint: str | None) -> None:
+def setup_tracing(service_name: str, otlp_endpoint: str | None, sample_ratio: float = 1.0) -> None:
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
 
     if isinstance(trace.get_tracer_provider(), TracerProvider):
         return
-    provider = TracerProvider(resource=Resource.create({"service.name": service_name}))
+    from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
+
+    # Head sampling keeps span export (encoding runs in a background thread and holds the GIL)
+    # from stalling the event loop at high request rates. Upstream sampling decisions are respected.
+    provider = TracerProvider(
+        resource=Resource.create({"service.name": service_name}),
+        sampler=ParentBased(TraceIdRatioBased(sample_ratio)),
+    )
     if otlp_endpoint:
         from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
