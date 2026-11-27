@@ -3,6 +3,7 @@ import re
 import time
 
 import httpx
+import pytest
 
 from tests.conftest import BASE_POLICY, admin, chat, policy_dict
 
@@ -306,3 +307,194 @@ def test_request_id_echo_and_internal_error_shape(client):
     r = chat(client)
     assert r.status_code == 500 and r.json()["error"]["code"] == "internal_error"
     assert r.headers["X-Request-ID"]
+
+
+def test_unconfigured_provider_is_skipped_visibly(make_client, monkeypatch):
+    monkeypatch.delenv("UNSET_CLAUDE_KEY", raising=False)
+    data = policy_dict()
+    data["providers"].insert(
+        0, {"name": "claude", "kind": "anthropic", "model": "claude-opus-5-5", "api_key_env": "UNSET_CLAUDE_KEY"}
+    )
+    data["tiers"]["balanced"] = ["claude", "primary", "secondary"]
+    data["tiers"]["solo"] = ["claude"]
+    client = make_client(data)
+    meta = chat(client).json()["x_gateway"]
+    assert meta["provider"] == "primary" and meta["attempts"] == ["claude: not configured"]
+    report = admin(client, "GET", "/v1/admin/providers").json()["claude"]
+    assert report["configured"] is False and report["status"] == "not_configured"
+    r = chat(client, tier="solo")
+    assert r.status_code == 503  # a tier with only unconfigured providers cannot serve
+    assert client.get("/readyz").json()["tiers"]["solo"] is False
+
+
+def test_production_refuses_tier_without_configured_provider(policy_file, monkeypatch):
+    from app.main import create_app
+    from app.policy import PolicyManager, hash_key
+    from app.settings import Settings
+
+    monkeypatch.delenv("UNSET_CLAUDE_KEY", raising=False)
+    data = policy_dict()
+    for team in data["teams"]:
+        team["api_key_sha256"] = [hash_key(k) for k in team.pop("api_keys")]
+    data["providers"].append({"name": "claude", "kind": "anthropic", "model": "m", "api_key_env": "UNSET_CLAUDE_KEY"})
+    data["tiers"]["solo"] = ["claude"]
+    settings = Settings(
+        environment="production",
+        admin_api_key="k" * 32,
+        redis_url="redis://x",
+        audit_log_path=None,
+        health_checks_enabled=False,
+    )
+    with pytest.raises(ValueError, match="no configured provider"):
+        create_app(settings, policy=PolicyManager(policy_file(data), forbid_plaintext_keys=True))
+
+
+def test_admission_reserves_provider_max_tokens_floor(make_client, monkeypatch):
+    monkeypatch.setenv("SET_CLAUDE_KEY", "sk-test")
+    data = policy_dict()
+    data["providers"].insert(
+        0,
+        {"name": "claude", "kind": "anthropic", "model": "m", "api_key_env": "SET_CLAUDE_KEY", "min_max_tokens": 1024},
+    )
+    data["tiers"]["balanced"] = ["claude", "primary"]
+    data["teams"][0]["tokens_per_minute"] = 1000
+    client = make_client(data)
+    # The client asks for 1 token, but the provider would raise it to 1024: admission must count 1024.
+    r = chat(client, max_tokens=1)
+    assert r.status_code == 429 and "1000/min" in r.json()["error"]["message"]
+
+
+async def test_retired_adapter_closes_only_after_in_flight_calls_finish():
+    from app.policy import ProviderConfig
+    from app.providers.mock import MockProvider
+
+    closed = []
+
+    class Tracked(MockProvider):
+        async def aclose(self):
+            closed.append(True)
+
+    p = Tracked(ProviderConfig(name="m", kind="mock"))
+    p.acquire()
+    await p.retire()
+    assert closed == []  # still in use
+    await p.release()
+    assert closed == [True]
+
+
+async def test_reload_cannot_raise_the_sent_output_cap_above_the_admission_reservation(policy_file):
+    from app.audit import AuditLog
+    from app.gateway import Gateway
+    from app.observability import Metrics
+    from app.policy import PolicyManager
+    from app.schemas import ChatMessage, ChatRequest
+    from app.stores import MemoryStore
+
+    manager = PolicyManager(policy_file(policy_dict()))
+    gw = Gateway(manager, MemoryStore(), Metrics(), AuditLog(None))
+    team = manager.team(manager.policy.teams[0].team_id)
+    adm = await gw.admit(
+        team, ChatRequest(model="balanced", messages=[ChatMessage(role="user", content="hi")], max_tokens=16)
+    )
+    assert adm.output_caps == {"primary": 16, "secondary": 16}
+    sent = []
+    adapter = gw.providers["primary"]
+    original = adapter.complete
+
+    async def record(creq):
+        sent.append(creq.max_tokens)
+        return await original(creq)
+
+    adapter.complete = record
+    # A reload after admission raises the provider's floor far above what was reserved.
+    manager.policy.provider("primary").min_max_tokens = 4096
+    await gw._invoke("primary", adm.creq, adm.output_caps)
+    assert sent == [16]  # capped at the admission-time reservation
+    assert gw._sized("primary", adm.creq, None).max_tokens == 4096  # probes (no reservation) get the floor
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_refusal_charges_the_usage_the_provider_billed(policy_file, streaming):
+    from app.audit import AuditLog
+    from app.errors import GatewayError
+    from app.gateway import Gateway
+    from app.observability import Metrics
+    from app.policy import PolicyManager
+    from app.providers import ProviderError
+    from app.schemas import ChatMessage, ChatRequest
+    from app.stores import MemoryStore
+
+    manager = PolicyManager(policy_file(policy_dict()))
+    store = MemoryStore()
+    gw = Gateway(manager, store, Metrics(), AuditLog(None))
+    team = manager.policy.teams[0]
+    refusal = ProviderError("primary", "content_policy", "refused", retryable=False, usage=(1000, 500))
+
+    async def refuse(creq):
+        raise refusal
+
+    async def refuse_stream(creq):
+        raise refusal
+        yield  # pragma: no cover
+
+    gw.providers["primary"].complete = refuse
+    gw.providers["primary"].stream = refuse_stream
+    req = ChatRequest(model="balanced", messages=[ChatMessage(role="user", content="hi")], max_tokens=16)
+    adm = await gw.admit(team, req)
+    with pytest.raises(GatewayError) as exc:
+        if streaming:
+            await gw.stream(adm)
+        else:
+            await gw.complete(adm)
+    assert exc.value.status_code == 400
+    spent, _ = await store.budget_status(team.team_id)
+    assert spent == pytest.approx((1000 * 1.0 + 500 * 2.0) / 1e6)  # primary's prices, not $0
+
+
+async def test_provider_configured_after_admission_is_skipped(policy_file, monkeypatch):
+    """No budget was reserved for it, so it must not be called for this request."""
+    from app.audit import AuditLog
+    from app.gateway import Gateway
+    from app.observability import Metrics
+    from app.policy import PolicyManager
+    from app.schemas import ChatMessage, ChatRequest
+    from app.stores import MemoryStore
+
+    monkeypatch.delenv("LATE_KEY", raising=False)
+    data = policy_dict()
+    data["providers"][0]["api_key_env"] = "LATE_KEY"  # primary starts unconfigured
+    manager = PolicyManager(policy_file(data))
+    gw = Gateway(manager, MemoryStore(), Metrics(), AuditLog(None))
+    req = ChatRequest(model="balanced", messages=[ChatMessage(role="user", content="hi")], max_tokens=16)
+    adm = await gw.admit(manager.policy.teams[0], req)
+    assert set(adm.output_caps) == {"secondary"}
+    monkeypatch.setenv("LATE_KEY", "now-set")  # primary becomes configured before routing
+    provider, _ = await gw.route(adm)
+    assert provider == "secondary" and "primary: not admitted" in adm.attempts
+
+
+async def test_mid_stream_refusals_do_not_open_the_shared_circuit(policy_file):
+    from app.audit import AuditLog
+    from app.gateway import Gateway
+    from app.observability import Metrics
+    from app.policy import PolicyManager
+    from app.providers import ProviderError, StreamChunk
+    from app.schemas import ChatMessage, ChatRequest
+    from app.stores import MemoryStore
+
+    manager = PolicyManager(policy_file(policy_dict()))
+    gw = Gateway(manager, MemoryStore(), Metrics(), AuditLog(None))
+    threshold = manager.policy.resilience.circuit_failure_threshold
+
+    async def refuse_after_text(creq):
+        yield StreamChunk(delta="partial")
+        raise ProviderError("primary", "content_policy", "refused", retryable=False, usage=(10, 5))
+
+    gw.providers["primary"].stream = refuse_after_text
+    req = ChatRequest(model="balanced", messages=[ChatMessage(role="user", content="hi")], max_tokens=16)
+    for _ in range(threshold + 1):
+        adm = await gw.admit(manager.policy.teams[0], req)
+        provider, body = await gw.stream(adm)
+        frames = b"".join([f async for f in body])
+        assert provider == "primary" and b"upstream_stream_error" in frames
+    assert gw.breakers["primary"].current_state() == "closed"

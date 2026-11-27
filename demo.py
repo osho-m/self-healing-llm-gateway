@@ -33,15 +33,21 @@ DEMO_TEAM = policy.team("demo")
 PRIMARY = "mock-primary"
 MAX_SESSIONS = 256
 
-# One gateway (limits, budgets, circuits, fault switches) per browser session, so one visitor's
-# outage toggle or rate-limit usage never affects another. Least recently used sessions are evicted.
+# One gateway per browser session, so one visitor's outage toggle and circuit state never affect
+# another. Least recently used sessions are evicted.
+#
+# Rate limits and the daily budget live in ONE store shared by every session: they are a
+# process-wide cap on spend. Per-session stores would let anyone reset the budget by opening a
+# new tab. The store is in memory, so a Space restart resets it; for a paid provider also set a
+# spend limit at the provider (e.g. in the Anthropic Console) as the hard backstop.
+_shared_store = MemoryStore()
 _sessions: OrderedDict[str, Gateway] = OrderedDict()
 # Gradio runs sync handlers in worker threads and async ones on the event loop.
 _sessions_lock = threading.Lock()
 
 
 def _new_gateway() -> Gateway:
-    return Gateway(policy, MemoryStore(), Metrics(), AuditLog(None))
+    return Gateway(policy, _shared_store, Metrics(), AuditLog(None))
 
 
 def gateway_for(request: gr.Request | None) -> Gateway:

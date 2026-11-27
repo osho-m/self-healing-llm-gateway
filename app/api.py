@@ -126,7 +126,7 @@ async def readyz(gw: GatewayDep):
     store_ok = await gw.store.ping()
     report = gw.health_report()
     tiers_ok = {
-        tier: any(report[p]["circuit"] != "open" for p in chain if p in report)
+        tier: any(report[p]["configured"] and report[p]["circuit"] != "open" for p in chain if p in report)
         for tier, chain in gw.policy.tiers.items()
     }
     ready = store_ok and all(tiers_ok.values())
