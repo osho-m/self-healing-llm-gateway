@@ -78,7 +78,7 @@ curl -X POST http://localhost:8000/v1/chat/completions \
   -d '{"model":"balanced","messages":[{"role":"user","content":"Explain circuit breakers."}]}'
 ```
 
-The answer looks like an OpenAI chat completion, plus a `x_gateway` section that shows which model answered, every attempt, and the cost.
+The answer looks like an OpenAI chat completion, plus an `x_gateway` section that shows which model answered, every attempt, and the cost.
 
 ## Learn more
 
