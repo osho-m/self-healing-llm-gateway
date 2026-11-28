@@ -5,19 +5,35 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Live demo](https://img.shields.io/badge/live%20demo-Hugging%20Face-orange)](https://huggingface.co/spaces/oshom/self-healing-llm-gateway)
 
-A gateway that sits between your apps and your AI models. It keeps each team within its limits, and when a model fails, it switches to another one so your app keeps answering.
+A gateway that sits between your apps and your AI models. It keeps each team within its limits and budget, and when a model fails, it switches to another one so your app keeps answering.
 
 **[Try the live demo](https://huggingface.co/spaces/oshom/self-healing-llm-gateway)**
 
 ![Live demo: Qwen answers; then Qwen is switched off and the gateway fails over to Phi-3.5-mini](docs/images/failover-demo.gif)
 
+## The problem
+
+When several teams share AI models, three things go wrong: one busy team uses up capacity another needs, a runaway job spends the month's budget in an afternoon, and one model going down takes the product with it. The gateway handles all three in one place.
+
+## How it works
+
+Every request takes the same path:
+
+1. **Check the team.** The gateway reads the team's API key and adds the team's rules, such as a system prompt.
+2. **Admit or refuse.** In one atomic step in Redis, it checks the team's rate limit and reserves the most the request could cost. A team over its limit or budget gets a clear `429` answer.
+3. **Pick a healthy model.** Apps ask for a tier (`economy`, `balanced` or `premium`), not a model. The gateway tries the tier's models in order, retries short failures, and skips any model whose circuit breaker is open.
+4. **Charge the real cost.** After the model answers, the gateway charges what the call really cost and releases the rest of the reservation.
+
+A circuit breaker opens when a model keeps failing, so traffic moves to the next model. After a cooldown, one test request checks whether the model has recovered. When several copies of the gateway run behind a load balancer, they share open circuits through Redis.
+
 ## What it does
 
-- **Limits per team.** Caps requests and tokens per minute for each team.
-- **Budgets in dollars.** Reserves the cost before a call and charges the real cost after, so no team can overspend.
-- **Heals itself.** Retries failed calls, stops sending traffic to a broken model, and switches to the next one. It checks later whether the broken model has recovered. When you run several copies of the gateway, they share this through Redis.
-- **Works with any model.** Runs three open-source models by default (SmolLM2, Qwen2.5 and Phi-3.5). Paid APIs like Anthropic or OpenAI can be added in the config.
-- **Easy to watch.** Comes with metrics, traces, Grafana dashboards and Slack alerts.
+- **Limits per team:** requests and tokens per minute, with batch jobs kept from starving live users.
+- **Budgets in dollars:** reserve first, settle after, so parallel and streaming requests cannot overspend.
+- **Self-healing:** retries with backoff, circuit breakers, and fallback across three open-source models (SmolLM2, Qwen2.5 and Phi-3.5).
+- **Any model:** Ollama, vLLM, models running on a GPU inside the gateway, or hosted APIs such as Anthropic.
+- **Easy to watch:** Prometheus metrics, OpenTelemetry traces, Grafana dashboards and Slack alerts.
+- **Safe by default:** production mode refuses unsafe settings, keys are stored only as hashes, and every admin change is audited.
 
 ## Results
 
@@ -27,10 +43,10 @@ A gateway that sits between your apps and your AI models. It keeps each team wit
 | Most requests handled per second | 630, with zero errors |
 | Speed-up from one fix | 83 to 463 requests per second, after replacing a slow HTTP client |
 | Real model outage | The gateway switched to the backup model and switched back when the model returned |
-| Live demo | Qwen2.5-1.5B answered in 3.3 s. With Qwen down, the gateway switched and Phi-3.5-mini answered in 4.4 s |
-| Tests | 112 tests, run on every change |
+| Live demo | Qwen2.5-1.5B answered in 3.3 s. With Qwen down, Phi-3.5-mini answered in 4.4 s |
+| Tests | 112 tests on Python 3.11 to 3.13, run on every change |
 
-How these were measured: [docs/benchmarks.md](docs/benchmarks.md).
+How these were measured: [benchmarks](docs/benchmarks.md).
 
 ## See the healing
 
@@ -42,47 +58,14 @@ In the [live demo](https://huggingface.co/spaces/oshom/self-healing-llm-gateway)
 
 The demo runs three open-source models on a free Hugging Face GPU. When your free GPU time runs out, the gateway falls back to a simple built-in answer and the health panel says why.
 
-## Run it
+## Tech stack
 
-With Docker (gateway, Redis, Grafana, Prometheus and Jaeger):
-
-```bash
-cp .env.example .env
-docker compose up --build
-```
-
-Once it is running on your machine, the API docs are at `localhost:8000/docs` and Grafana is at `localhost:3000`.
-
-Or on your own machine with three open-source models from [Ollama](https://ollama.com):
-
-```bash
-ollama pull smollm2:1.7b && ollama pull qwen2.5:1.5b && ollama pull phi3.5:3.8b
-pip install -e '.[dev]'
-GATEWAY_POLICY_PATH=config/policy.ollama.yml GATEWAY_ADMIN_API_KEY=local-admin-key-0123456789 \
-  uvicorn app.main:app_factory --factory
-```
-
-On Windows PowerShell:
-
-```powershell
-$env:GATEWAY_POLICY_PATH = "config/policy.ollama.yml"
-$env:GATEWAY_ADMIN_API_KEY = "local-admin-key-0123456789"
-uvicorn app.main:app_factory --factory
-```
-
-Send a request:
-
-```bash
-curl -X POST http://localhost:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' -H 'X-API-Key: demo-live-key' \
-  -d '{"model":"balanced","messages":[{"role":"user","content":"Explain circuit breakers."}]}'
-```
-
-The answer looks like an OpenAI chat completion, plus an `x_gateway` section that shows which model answered, every attempt, and the cost.
+Python, FastAPI, aiohttp, Redis (Lua scripts), Hugging Face Transformers, Ollama, Docker, Prometheus, Grafana, OpenTelemetry, Jaeger, GitHub Actions, Gradio.
 
 ## Learn more
 
-- [Reference](docs/reference.md): API, errors, configuration, monitoring, tests and roadmap
+- [Getting started](docs/getting-started.md): run it with Docker or on your own machine
+- [Reference](docs/reference.md): API, errors, configuration, monitoring and roadmap
 - [Models](docs/providers.md): every supported model type and its settings
 - [Benchmarks](docs/benchmarks.md): how the speed numbers were measured
 - [Real-model run](docs/real-model-run.md): a real outage on a laptop
